@@ -147,8 +147,13 @@ activemq-data/
 # SageMath parsed files
 *.sage.py
 
+# Local upload storage (backend's own settings.upload_storage_dir default) —
+# real/test-uploaded PDFs, never committed.
+backend/data/
+
 # Environments
 .env
+.env.staging
 .envrc
 .venv
 env/

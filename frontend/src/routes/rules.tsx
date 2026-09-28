@@ -1,14 +1,13 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
-import { Pencil } from "lucide-react";
 import { PageHeader } from "@/components/AppSidebar";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { RULES } from "@/lib/mock-data";
+import { listRules } from "@/lib/api";
 
 export const Route = createFileRoute("/rules")({
+  loader: () => listRules(),
   head: () => ({
     meta: [
       { title: "Rules — Session Note Compliance" },
@@ -21,10 +20,11 @@ export const Route = createFileRoute("/rules")({
 });
 
 function RulesPage() {
+  const rules = Route.useLoaderData();
   const [q, setQ] = useState("");
   const rows = useMemo(
-    () => RULES.filter((r) => r.question.toLowerCase().includes(q.toLowerCase())),
-    [q],
+    () => rules.filter((r) => r.question.toLowerCase().includes(q.toLowerCase())),
+    [rules, q],
   );
 
   return (
@@ -49,12 +49,11 @@ function RulesPage() {
                   <th className="px-5 py-3 font-medium">Applies to</th>
                   <th className="px-5 py-3 font-medium">Type</th>
                   <th className="px-5 py-3 font-medium">Severity</th>
-                  <th className="px-5 py-3 font-medium"></th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((r) => (
-                  <tr key={r.question} className="border-b last:border-0 hover:bg-muted/50">
+                  <tr key={r.rule_id} className="border-b last:border-0 hover:bg-muted/50">
                     <td className="max-w-xl px-5 py-3 font-medium">{r.question}</td>
                     <td className="px-5 py-3">
                       <div className="flex flex-wrap gap-1">
@@ -78,11 +77,6 @@ function RulesPage() {
                       >
                         {r.severity}
                       </span>
-                    </td>
-                    <td className="px-5 py-3 text-right">
-                      <Button size="icon" variant="ghost" aria-label="Edit rule">
-                        <Pencil className="h-4 w-4" />
-                      </Button>
                     </td>
                   </tr>
                 ))}

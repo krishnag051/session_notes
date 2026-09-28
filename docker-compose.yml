@@ -1,0 +1,79 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # Not exposed on the host (no top-level "ports:" for postgres) — same
+    # zero-trust reasoning as the old TP-review project's own compose file:
+    # if only SSH is open externally on the real server, publishing 5432
+    # does nothing for outside access and just adds unused attack surface.
+    # Tunnel over SSH if psql access is ever needed:
+    #   ssh -L 5432:localhost:5432 <user>@<server>
+    volumes:
+      - session_notes_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    # Pulled from Docker Hub — the server never needs the repo source at
+    # all for this service. CONFIRM this repo name with Krishna before
+    # first real push/deploy — this is a placeholder following the old TP
+    # project's own naming convention (krishna0051/reviewer-backend), not a
+    # confirmed real Docker Hub repo.
+    image: krishna0051/session-notes-backend:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS}
+      UPLOAD_STORAGE_DIR: /app/data/uploads
+      # Real Postgres/Anthropic/OpenRouter secrets are deliberately NOT set
+      # here — they live only in the .env file sitting next to this
+      # compose file on the server, which is never committed to git.
+    ports:
+      # Final: distinct from the old TP-review stack's 8000 (backend) /
+      # 5173 (frontend) on the same real server, confirmed by Krishna.
+      - "8005:8000"
+    volumes:
+      - session_notes_uploads_data:/app/data/uploads
+      # Not yet written by anything real (session_note_extraction.py isn't
+      # wired into a real call site yet — see backend Phase 3's own
+      # report) — mounted now so the moment it is, a restart can't
+      # silently re-trigger billed calls for files already processed.
+      - session_notes_session_note_cache:/agent-making/agent/.cache/session_note_extractions
+
+  frontend:
+    # Pulled from Docker Hub — IMPORTANT: this image must be (re)built
+    # locally with the real production VITE_API_BASE_URL baked in via
+    # --build-arg BEFORE pushing (see frontend/Dockerfile's own comment):
+    #   docker build --build-arg VITE_API_BASE_URL=http://localhost:8005/api \
+    #     -f frontend/Dockerfile -t krishna0051/session-notes-frontend:latest .
+    # Changing this compose file alone does nothing — Vite bakes the value
+    # in at `docker build` time, not container start. FLAG: this backend's
+    # own routers are NOT currently mounted under an /api prefix (routes
+    # are plain /batches, /person-documents/..., etc.) — this value
+    # assumes one exists, matching the old TP-review project's own
+    # convention. Add an /api prefix to app/main.py's router includes, or
+    # drop "/api" from this value, before this actually points at a real route.
+    image: krishna0051/session-notes-frontend:latest
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      # Final: distinct from the old TP stack's 5173, confirmed by Krishna.
+      - "3005:80"
+
+volumes:
+  session_notes_postgres_data:
+  session_notes_uploads_data:
+  session_notes_session_note_cache:

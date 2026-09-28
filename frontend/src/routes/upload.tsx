@@ -1,10 +1,10 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, useRouter } from "@tanstack/react-router";
 import { useRef, useState } from "react";
-import { UploadCloud, FileText, CheckCircle2 } from "lucide-react";
+import { UploadCloud, FileText, CheckCircle2, XCircle } from "lucide-react";
 import { PageHeader } from "@/components/AppSidebar";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
+import { uploadBatch } from "@/lib/api";
 
 export const Route = createFileRoute("/upload")({
   head: () => ({
@@ -18,35 +18,32 @@ export const Route = createFileRoute("/upload")({
   component: UploadPage,
 });
 
-type Phase = "idle" | "processing" | "done";
+type Phase = "idle" | "processing" | "done" | "error";
 
 function UploadPage() {
+  const router = useRouter();
   const [phase, setPhase] = useState<Phase>("idle");
   const [fileName, setFileName] = useState("");
-  const [progress, setProgress] = useState(0);
   const [finishedAt, setFinishedAt] = useState("");
+  const [peopleCount, setPeopleCount] = useState(0);
+  const [errorMessage, setErrorMessage] = useState("");
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  function start(name: string) {
-    setFileName(name);
+  async function start(file: File) {
+    setFileName(file.name);
     setPhase("processing");
-    setProgress(8);
-    const timer = setInterval(() => {
-      setProgress((p) => {
-        if (p >= 95) {
-          clearInterval(timer);
-          return 100;
-        }
-        return p + 9;
-      });
-    }, 220);
-    setTimeout(() => {
-      clearInterval(timer);
-      setProgress(100);
+    try {
+      const batch = (await uploadBatch(file)) as { documents: { person_id: string | null }[] };
+      const distinctPeople = new Set(batch.documents.map((d) => d.person_id).filter(Boolean));
+      setPeopleCount(distinctPeople.size);
       setFinishedAt(new Date().toLocaleString());
       setPhase("done");
-    }, 2800);
+      router.invalidate();
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+      setPhase("error");
+    }
   }
 
   return (
@@ -66,7 +63,7 @@ function UploadPage() {
                 e.preventDefault();
                 setDragging(false);
                 const f = e.dataTransfer.files?.[0];
-                start(f ? f.name : "session-notes-batch.pdf");
+                if (f) start(f);
               }}
               onClick={() => inputRef.current?.click()}
               className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-20 text-center transition-colors ${
@@ -83,7 +80,7 @@ function UploadPage() {
                 className="hidden"
                 onChange={(e) => {
                   const f = e.target.files?.[0];
-                  start(f ? f.name : "session-notes-batch.pdf");
+                  if (f) start(f);
                 }}
               />
             </div>
@@ -94,14 +91,15 @@ function UploadPage() {
               <FileText className="h-10 w-10 animate-pulse text-primary" />
               <div className="mt-4 text-base font-semibold">Processing upload… classifying documents</div>
               <p className="mt-1 text-sm text-muted-foreground">{fileName}</p>
-              <Progress value={progress} className="mt-6 w-full max-w-md" />
             </div>
           )}
 
           {phase === "done" && (
             <div className="flex flex-col items-center px-6 py-20 text-center">
               <CheckCircle2 className="h-10 w-10 text-success" />
-              <div className="mt-4 text-base font-semibold">Upload complete — 6 patients processed</div>
+              <div className="mt-4 text-base font-semibold">
+                Upload complete — {peopleCount} {peopleCount === 1 ? "patient" : "patients"} processed
+              </div>
               <p className="mt-1 text-sm text-muted-foreground">
                 {fileName} · {finishedAt}
               </p>
@@ -113,6 +111,17 @@ function UploadPage() {
                   Upload another
                 </Button>
               </div>
+            </div>
+          )}
+
+          {phase === "error" && (
+            <div className="flex flex-col items-center px-6 py-20 text-center">
+              <XCircle className="h-10 w-10 text-destructive" />
+              <div className="mt-4 text-base font-semibold">Upload failed</div>
+              <p className="mt-1 max-w-md text-sm text-muted-foreground">{errorMessage}</p>
+              <Button variant="outline" className="mt-6" onClick={() => setPhase("idle")}>
+                Try again
+              </Button>
             </div>
           )}
         </CardContent>

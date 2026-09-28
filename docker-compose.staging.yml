@@ -1,0 +1,124 @@
+# Staging/local instance, entirely separate from production. Standalone
+# file (not merged with docker-compose.yml) — production pulls prebuilt
+# `:latest` images from Docker Hub, staging builds fresh from whatever's
+# checked out locally right now, so the two service definitions are
+# structurally different in a way an override file can't cleanly express
+# (you can't "unset" `image:` by layering a `build:` on top of it). Same
+# reasoning as the prior TP-review project's own staging compose file.
+#
+# Usage:
+#   docker compose -f docker-compose.staging.yml -p session-notes-staging up -d --build
+# (No --env-file flag needed — nothing in this file uses ${VAR}
+# interpolation; the backend service's own `env_file: .env.staging` below
+# is what actually injects the real keys into that one container.)
+#
+# -p session-notes-staging gives this its own Compose project namespace, so
+# its containers/networks/volumes never collide with production's. The
+# volume names below are ALSO explicitly suffixed with _staging, as a
+# second, belt-and-suspenders guarantee: even if this is ever accidentally
+# run without -p on the same Docker host as production, it still cannot
+# reach production's session_notes_postgres_data / session_notes_uploads_data
+# volumes — there is no name it could collide with.
+#
+# Real-key parity: ANTHROPIC_API_KEY and OPENROUTER_API_KEY come from
+# .env.staging (added directly by whoever's using this, not baked in here)
+# — .env.staging.example ships with blank values as the SAFE DEFAULT for
+# anyone who hasn't explicitly opted into real spend. Nothing in this
+# compose file itself makes any API call; a real charge only happens when
+# a real (non-mocked) review is actually submitted through the running
+# stack. Confirmed the built image never copies agent-making/.env or
+# agent-making/agent/.env (only agent-making/agent/pipeline and
+# rules/rules.json, per backend/Dockerfile), so a real key sitting in
+# either file on the host machine can't leak into this container by
+# accident — the only way a real key reaches this container is the
+# explicit env_file below.
+#
+# No "simulated completion" dev shortcut built here (unlike the old TP
+# project's ALLOW_SIMULATED_COMPLETION flag) — that was a deliberate,
+# separately-decided feature there, not an automatic part of dockerizing.
+# Build one for this project only if explicitly asked for later; until
+# then, staging without a real key simply fails closed on review, same as
+# production would.
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: snuser_staging
+      POSTGRES_PASSWORD: snpass_staging
+      POSTGRES_DB: session_notes_staging
+    # Local-only convenience port (psql from the host) — staging never runs
+    # anywhere zero-trust rules apply, unlike production's postgres, which
+    # stays unpublished on purpose (see docker-compose.yml).
+    ports:
+      # Final: deliberately not 5433 — that's the old TP-review staging
+      # stack's own postgres port.
+      - "5435:5432"
+    volumes:
+      - session_notes_postgres_data_staging:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U snuser_staging -d session_notes_staging"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      # Repo root, same reason as production's build (see backend/Dockerfile's
+      # own top comment) — it COPYs agent-making/ from outside ./backend.
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      # Only the two possibly-real-secret values (ANTHROPIC_API_KEY,
+      # OPENROUTER_API_KEY) come from here — see .env.staging.example.
+      # Everything else below is hardcoded directly since none of it is a
+      # real secret for a local-only staging instance.
+      - .env.staging
+    environment:
+      DATABASE_URL: postgresql+psycopg2://snuser_staging:snpass_staging@postgres:5432/session_notes_staging
+      # The ONE fixed staging frontend address — exact-match, not a
+      # wildcard, matching the old project's own decision to skip a
+      # wildcard-origin problem entirely by using a single known local origin.
+      CORS_ALLOW_ORIGINS: "http://localhost:3006"
+      UPLOAD_STORAGE_DIR: /app/data/uploads
+      # ANTHROPIC_API_KEY / OPENROUTER_API_KEY: intentionally NOT hardcoded
+      # here — they come from `env_file: .env.staging` above instead, so
+      # the real value never sits in a file this repo would ever commit.
+      # Unset means a real review fails closed (the safe default); a real
+      # key means it runs for real.
+    ports:
+      # Final: distinct from the old TP-review staging stack's 8001
+      # (backend) / 3001 (frontend) / 5433 (postgres).
+      - "8006:8000"
+    volumes:
+      - session_notes_uploads_data_staging:/app/data/uploads
+      - session_notes_session_note_cache_staging:/agent-making/agent/.cache/session_note_extractions
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        # Baked in at build time (Vite), not read at container start —
+        # points at the staging backend's own published port, never
+        # production's. FLAG: this backend's own routers are NOT currently
+        # mounted under an /api prefix (routes are plain /batches,
+        # /person-documents/..., etc.) — this value assumes one exists,
+        # matching the old TP-review project's own convention. Add an
+        # /api prefix to app/main.py's router includes, or drop "/api"
+        # from this value, before this actually points at a real route.
+        VITE_API_BASE_URL: "http://localhost:8006/api"
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3006:80"
+
+volumes:
+  session_notes_postgres_data_staging:
+  session_notes_uploads_data_staging:
+  session_notes_session_note_cache_staging:

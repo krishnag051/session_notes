@@ -1,0 +1,41 @@
+[project]
+name = "session-notes-backend"
+version = "0.1.0"
+description = "Session Note Compliance backend — FastAPI + Postgres"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "psycopg2-binary>=2.9",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "python-multipart>=0.0.12",
+    "pypdf>=4.0",
+    # --- agent-making wiring ---
+    # app/agent_client.py imports agent-making/agent/pipeline/api.py by path
+    # (not an installed package), but that module's own import chain needs
+    # these at import time, in WHICHEVER process does the importing — this
+    # backend process, not just agent-making's own. Versions matched to
+    # agent-making/requirements.txt.
+    "anthropic>=0.68.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]

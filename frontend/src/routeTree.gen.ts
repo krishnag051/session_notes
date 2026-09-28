@@ -11,7 +11,6 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AuditsRouteImport } from './routes/audits'
-import { Route as PeopleRouteImport } from './routes/people'
 import { Route as RulesRouteImport } from './routes/rules'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as UploadRouteImport } from './routes/upload'
@@ -26,11 +25,6 @@ const IndexRoute = IndexRouteImport.update({
 const AuditsRoute = AuditsRouteImport.update({
   id: '/audits',
   path: '/audits',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const PeopleRoute = PeopleRouteImport.update({
-  id: '/people',
-  path: '/people',
   getParentRoute: () => rootRouteImport,
 } as any)
 const RulesRoute = RulesRouteImport.update({
@@ -62,7 +56,6 @@ const AuditsAuditIdRoute = AuditsAuditIdRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/audits': typeof AuditsRouteWithChildren
-  '/people': typeof PeopleRoute
   '/rules': typeof RulesRoute
   '/settings': typeof SettingsRoute
   '/upload': typeof UploadRoute
@@ -71,7 +64,6 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
-  '/people': typeof PeopleRoute
   '/rules': typeof RulesRoute
   '/settings': typeof SettingsRoute
   '/upload': typeof UploadRoute
@@ -82,7 +74,6 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/audits': typeof AuditsRouteWithChildren
-  '/people': typeof PeopleRoute
   '/rules': typeof RulesRoute
   '/settings': typeof SettingsRoute
   '/upload': typeof UploadRoute
@@ -94,26 +85,17 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/audits'
-    | '/people'
     | '/rules'
     | '/settings'
     | '/upload'
     | '/audits/$auditId'
     | '/audits/'
   fileRoutesByTo: FileRoutesByTo
-  to:
-    | '/'
-    | '/people'
-    | '/rules'
-    | '/settings'
-    | '/upload'
-    | '/audits/$auditId'
-    | '/audits'
+  to: '/' | '/rules' | '/settings' | '/upload' | '/audits/$auditId' | '/audits'
   id:
     | '__root__'
     | '/'
     | '/audits'
-    | '/people'
     | '/rules'
     | '/settings'
     | '/upload'
@@ -124,7 +106,6 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AuditsRoute: typeof AuditsRouteWithChildren
-  PeopleRoute: typeof PeopleRoute
   RulesRoute: typeof RulesRoute
   SettingsRoute: typeof SettingsRoute
   UploadRoute: typeof UploadRoute
@@ -144,13 +125,6 @@ declare module '@tanstack/react-router' {
       path: '/audits'
       fullPath: '/audits'
       preLoaderRoute: typeof AuditsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/people': {
-      id: '/people'
-      path: '/people'
-      fullPath: '/people'
-      preLoaderRoute: typeof PeopleRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/rules': {
@@ -207,7 +181,6 @@ const AuditsRouteWithChildren =
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AuditsRoute: AuditsRouteWithChildren,
-  PeopleRoute: PeopleRoute,
   RulesRoute: RulesRoute,
   SettingsRoute: SettingsRoute,
   UploadRoute: UploadRoute,
@@ -215,13 +188,3 @@ const rootRouteChildren: RootRouteChildren = {
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()
-
-import type { getRouter } from './router.tsx'
-import type { startInstance } from './start.ts'
-declare module '@tanstack/react-start' {
-  interface Register {
-    ssr: true
-    router: Awaited<ReturnType<typeof getRouter>>
-    config: Awaited<ReturnType<typeof startInstance.getOptions>>
-  }
-}

@@ -4,17 +4,14 @@ import {
   UploadCloud,
   ClipboardCheck,
   ListChecks,
-  Users,
   Settings as SettingsIcon,
 } from "lucide-react";
-import { CURRENT_USER } from "@/lib/mock-data";
 
 const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, exact: true },
   { to: "/upload", label: "Upload", icon: UploadCloud },
   { to: "/audits", label: "Audits", icon: ClipboardCheck },
   { to: "/rules", label: "Rules", icon: ListChecks },
-  { to: "/people", label: "People", icon: Users },
   { to: "/settings", label: "Settings", icon: SettingsIcon },
 ] as const;
 
@@ -46,8 +43,7 @@ export function AppSidebar() {
       </nav>
 
       <div className="border-t border-sidebar-border px-5 py-4">
-        <div className="text-sm font-medium text-sidebar-accent-foreground">{CURRENT_USER.name}</div>
-        <div className="truncate text-xs text-sidebar-foreground/60">{CURRENT_USER.email}</div>
+        <div className="text-xs text-sidebar-foreground/60">No login required — see Settings for reviewers.</div>
       </div>
     </aside>
   );

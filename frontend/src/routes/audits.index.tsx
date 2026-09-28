@@ -1,9 +1,9 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
 import { PageHeader } from "@/components/AppSidebar";
-import { StatusBadge } from "@/routes/index";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -12,9 +12,36 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { AUDITS } from "@/lib/mock-data";
+import { listAudits, type AuditRow } from "@/lib/api";
+
+function AuditFlagsBadge({ flags }: { flags: AuditRow["audit_flags"] }) {
+  if (flags === null) {
+    return <Badge variant="secondary" className="bg-muted text-muted-foreground">—</Badge>;
+  }
+  return (
+    <Badge
+      className={flags === "PASSED" ? "bg-success/12 text-success hover:bg-success/12" : "bg-destructive/12 text-destructive hover:bg-destructive/12"}
+      variant="secondary"
+    >
+      {flags}
+    </Badge>
+  );
+}
+
+function ReviewStatusBadge({ status }: { status: AuditRow["review_status"] }) {
+  const reviewed = status === "Reviewed";
+  return (
+    <Badge
+      className={reviewed ? "bg-muted text-foreground hover:bg-muted" : "bg-warning/20 text-warning-foreground hover:bg-warning/20"}
+      variant="secondary"
+    >
+      {status}
+    </Badge>
+  );
+}
 
 export const Route = createFileRoute("/audits/")({
+  loader: () => listAudits(),
   head: () => ({
     meta: [
       { title: "Audits — Session Note Compliance" },
@@ -27,6 +54,7 @@ export const Route = createFileRoute("/audits/")({
 });
 
 function AuditsList() {
+  const audits = Route.useLoaderData();
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("All");
   const [from, setFrom] = useState("");
@@ -34,14 +62,14 @@ function AuditsList() {
 
   const rows = useMemo(
     () =>
-      AUDITS.filter((a) => {
-        if (search && !a.patient.toLowerCase().includes(search.toLowerCase())) return false;
-        if (status !== "All" && a.status !== status) return false;
-        if (from && a.dateOfService < from) return false;
-        if (to && a.dateOfService > to) return false;
+      audits.filter((a) => {
+        if (search && !(a.client ?? "").toLowerCase().includes(search.toLowerCase())) return false;
+        if (status !== "All" && a.audit_flags !== status) return false;
+        if (from && (a.date_of_service ?? "") < from) return false;
+        if (to && (a.date_of_service ?? "") > to) return false;
         return true;
       }),
-    [search, status, from, to],
+    [audits, search, status, from, to],
   );
 
   return (
@@ -69,8 +97,8 @@ function AuditsList() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="All">All statuses</SelectItem>
-                <SelectItem value="Passed">Passed</SelectItem>
-                <SelectItem value="Failed">Failed</SelectItem>
+                <SelectItem value="PASSED">Passed</SelectItem>
+                <SelectItem value="FAILED">Failed</SelectItem>
               </SelectContent>
             </Select>
             {(search || status !== "All" || from || to) && (
@@ -92,39 +120,49 @@ function AuditsList() {
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b text-left text-xs uppercase tracking-wide text-muted-foreground">
-                  <th className="px-5 py-3 font-medium">Patient</th>
+                  <th className="px-5 py-3 font-medium">Client</th>
                   <th className="px-5 py-3 font-medium">Code</th>
                   <th className="px-5 py-3 font-medium">Date of service</th>
                   <th className="px-5 py-3 font-medium">Provider</th>
                   <th className="px-5 py-3 font-medium">BCBA</th>
-                  <th className="px-5 py-3 font-medium">Status</th>
+                  <th className="px-5 py-3 font-medium">Start time</th>
+                  <th className="px-5 py-3 font-medium">End time</th>
                   <th className="px-5 py-3 font-medium">Score</th>
+                  <th className="px-5 py-3 font-medium">Reviewed by</th>
+                  <th className="px-5 py-3 font-medium">Review status</th>
+                  <th className="px-5 py-3 font-medium">Audit flags</th>
                   <th className="px-5 py-3 font-medium"></th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((a) => (
-                  <tr key={a.id} className="border-b last:border-0 hover:bg-muted/50">
+                  <tr key={a.person_document_id} className="border-b last:border-0 hover:bg-muted/50">
                     <td className="px-5 py-3 font-medium">
                       <Link
                         to="/audits/$auditId"
-                        params={{ auditId: a.id }}
+                        params={{ auditId: a.person_document_id }}
                         className="hover:text-primary hover:underline"
                       >
-                        {a.patient}
+                        {a.client ?? "Unresolved"}
                       </Link>
                     </td>
                     <td className="px-5 py-3 text-muted-foreground">{a.code}</td>
-                    <td className="px-5 py-3 text-muted-foreground">{a.dateOfService}</td>
-                    <td className="px-5 py-3 text-muted-foreground">{a.provider}</td>
-                    <td className="px-5 py-3 text-muted-foreground">{a.bcba}</td>
+                    <td className="px-5 py-3 text-muted-foreground">{a.date_of_service}</td>
+                    <td className="px-5 py-3 text-muted-foreground">{a.provider ?? "—"}</td>
+                    <td className="px-5 py-3 text-muted-foreground">{a.bcba ?? "—"}</td>
+                    <td className="px-5 py-3 text-muted-foreground">{a.start_time ?? "—"}</td>
+                    <td className="px-5 py-3 text-muted-foreground">{a.end_time ?? "—"}</td>
+                    <td className="px-5 py-3 font-medium">{a.score !== null ? `${a.score}%` : "—"}</td>
+                    <td className="px-5 py-3 text-muted-foreground">{a.reviewed_by ?? "—"}</td>
                     <td className="px-5 py-3">
-                      <StatusBadge status={a.status} />
+                      <ReviewStatusBadge status={a.review_status} />
                     </td>
-                    <td className="px-5 py-3 font-medium">{a.score}%</td>
+                    <td className="px-5 py-3">
+                      <AuditFlagsBadge flags={a.audit_flags} />
+                    </td>
                     <td className="px-5 py-3 text-right">
                       <Button asChild size="sm" variant="outline">
-                        <Link to="/audits/$auditId" params={{ auditId: a.id }}>
+                        <Link to="/audits/$auditId" params={{ auditId: a.person_document_id }}>
                           View
                         </Link>
                       </Button>
@@ -133,7 +171,7 @@ function AuditsList() {
                 ))}
                 {rows.length === 0 && (
                   <tr>
-                    <td colSpan={8} className="px-5 py-12 text-center text-muted-foreground">
+                    <td colSpan={12} className="px-5 py-12 text-center text-muted-foreground">
                       No audits match these filters.
                     </td>
                   </tr>
