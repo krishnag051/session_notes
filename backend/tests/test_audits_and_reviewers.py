@@ -40,9 +40,9 @@ def test_audits_list_includes_a_row_for_an_unreviewed_document(client):
     batch = _upload_batch(client, "batch_19page_3client.pdf")
     doc = next(d for d in batch["documents"] if d["service_code"] == "97153")
 
-    resp = client.get("/api/audits")
+    resp = client.get("/api/audits", params={"page_size": 1000})
     assert resp.status_code == 200
-    row = next(r for r in resp.json() if r["person_document_id"] == doc["id"])
+    row = next(r for r in resp.json()["items"] if r["person_document_id"] == doc["id"])
     assert row["review_status"] == "Not Reviewed"
     assert row["audit_flags"] is None
     assert row["score"] is None
@@ -57,8 +57,8 @@ def test_audits_list_reflects_a_completed_review(client, monkeypatch):
     monkeypatch.setattr(person_documents_module, "review_person_document", lambda *a, **k: _FakeResult(_findings()))
     client.post(f"/api/person-documents/{doc['id']}/review", json={})
 
-    resp = client.get("/api/audits")
-    row = next(r for r in resp.json() if r["person_document_id"] == doc["id"])
+    resp = client.get("/api/audits", params={"page_size": 1000})
+    row = next(r for r in resp.json()["items"] if r["person_document_id"] == doc["id"])
     assert row["score"] == 100.0
     assert row["audit_flags"] == "PASSED"
     assert row["review_status"] == "Not Reviewed"  # audit_result and reviewed are still independent axes
@@ -69,8 +69,8 @@ def test_audits_list_reflects_a_completed_review(client, monkeypatch):
 def test_audits_list_excludes_unresolved_documents(client):
     batch = _upload_batch(client, "batch_19page_3client.pdf")
     unresolved_ids = {d["id"] for d in batch["documents"] if d["classification_confidence"] == "unresolved"}
-    resp = client.get("/api/audits")
-    listed_ids = {r["person_document_id"] for r in resp.json()}
+    resp = client.get("/api/audits", params={"page_size": 1000})
+    listed_ids = {r["person_document_id"] for r in resp.json()["items"]}
     assert not (unresolved_ids & listed_ids)
 
 

@@ -3,13 +3,13 @@
   "rule_count": 65,
   "check_type_counts": {
     "judgment": 18,
-    "deterministic": 28,
-    "not_checkable": 19
+    "deterministic": 33,
+    "not_checkable": 14
   },
   "check_type_legend": {
     "deterministic": "Structural/arithmetic fact, zero cost/variance — see fields.py.",
     "judgment": "Genuine reading-comprehension call — goes through judge.py's majority-vote FINDINGS_TOOL call. A rule with needs_history=true has its extra_context built by history_comparison.py from prior_extractions first (short-circuited straight to not_checkable, never reaching judge.py, when no prior_extractions were passed in) — see the needs_history field below.",
-    "not_checkable": "Needs a second data source (timesheet, sibling document, same-day session ledger) not available to review_person_document's current single-document signature — marked by design, not guessed at."
+    "not_checkable": "Needs a second data source that genuinely doesn't exist yet for this specific record (a prior session note, a prior Treatment Plan version) — marked by design, not guessed at. CORRECTED (this phase): the Activity Statement — this batch's own timesheet, already sitting in the same uploaded PDF — is NOT one of these anymore; every 'align with the timesheet'/'15-minute break' rule is deterministic now (see fields.py::_check_timesheet_alignment / _check_same_day_location_break). A rule should only land on not_checkable when the thing it needs is outside (a) this document itself and (b) the Activity Statement, and that outside thing genuinely isn't available yet — never because the pipeline forgot the Activity Statement exists."
   },
   "needs_history_note": "needs_history=true marks the copy-paste / identical-data-point rules — the ones history_comparison.py handles by building their extra_context from this person's prior_extractions before judge.py ever sees them.",
   "rules": [
@@ -58,24 +58,24 @@
       "description": "Do the notes' start time, end time, date of service and location align with the timesheet?",
       "type": "Default",
       "severity": "Normal",
-      "check_type": "not_checkable",
+      "check_type": "deterministic",
       "needs_history": false,
       "flag": null,
       "conditional_on": null,
-      "notes": "Needs a timesheet — a second data source not yet available to this pipeline (flagged, not guessed at, per CLAUDE.md's honesty discipline).",
+      "notes": "The timesheet IS the Activity Statement page already sitting in the same uploaded batch PDF (classify_batch.py's own cover-page marker) — see fields.py::_check_timesheet_alignment / activity_statement.py. Compares this document's own extracted start/end time, date, and location against the timesheet row matching its own appendix. not_checkable only when the batch genuinely has no Activity Statement data recorded for it, or no row references this appendix — never a standing 'no timesheet available' assumption.",
       "active": true
     },
     {
       "rule_id": "SN-97151-05",
       "service_code": "97151",
-      "description": "If peers, siblings or other participants are mentioned in the session summary, are they listed as present in the 'Participants' section?",
+      "description": "Does the session summary's account of who was present agree with the 'Participants' section, in both directions — is anyone mentioned in the narrative (peers, siblings, or other participants) also checked as present, AND is anyone checked as present (e.g. a peer) also actually described in the narrative?",
       "type": "Default",
       "severity": "Normal",
       "check_type": "judgment",
       "needs_history": false,
       "flag": null,
       "conditional_on": null,
-      "notes": "Requires detecting person-mentions in freeform narrative text and cross-referencing against the Participants checkboxes.",
+      "notes": "DECIDED (real manual audit round, both directions confirmed as real violations worth flagging): a checked-present participant with ZERO narrative support is just as real a documentation gap as an unchecked narrative mention -- a reviewer/auditor checking whether the note actually substantiates everyone billed/logged as present needs both directions caught, not just one. Do NOT treat 'checked as present but never described in the narrative' as automatically fine just because the rule used to read one-directionally -- that pattern is now also a FAIL, same severity as the original direction. Requires detecting person-mentions in freeform narrative text and cross-referencing against the Participants checkboxes.",
       "active": true
     },
     {
@@ -279,11 +279,11 @@
       "description": "Do the note's start time, end time, date of service and location align with the timesheet?",
       "type": "Default",
       "severity": "Normal",
-      "check_type": "not_checkable",
+      "check_type": "deterministic",
       "needs_history": false,
       "flag": null,
       "conditional_on": null,
-      "notes": "Needs a timesheet — a second data source not yet available to this pipeline (flagged, not guessed at, per CLAUDE.md's honesty discipline).",
+      "notes": "The timesheet IS the Activity Statement page already sitting in the same uploaded batch PDF (classify_batch.py's own cover-page marker) — see fields.py::_check_timesheet_alignment / activity_statement.py. Compares this document's own extracted start/end time, date, and location against the timesheet row matching its own appendix. not_checkable only when the batch genuinely has no Activity Statement data recorded for it, or no row references this appendix — never a standing 'no timesheet available' assumption.",
       "active": true
     },
     {
@@ -315,14 +315,14 @@
     {
       "rule_id": "SN-97153-07",
       "service_code": "97153",
-      "description": "If peers, siblings, or other participants are mentioned in the session summary, are they listed as present in the 'who attended session' section?",
+      "description": "Does the session summary's account of who was present agree with the 'who attended session' section, in both directions — is anyone mentioned in the narrative (peers, siblings, or other participants) also checked as present, AND is anyone checked as present (e.g. a peer) also actually described in the narrative?",
       "type": "Default",
       "severity": "Normal",
       "check_type": "judgment",
       "needs_history": false,
       "flag": null,
       "conditional_on": null,
-      "notes": "Same reasoning as SN-97151-05.",
+      "notes": "DECIDED (real manual audit round, both directions confirmed as real violations worth flagging — this exact rule_id is where the 3-way judge inconsistency was found and root-caused): a checked-present participant with ZERO narrative support (e.g. 'Peer' checked in the attendance section but the session summary never mentions a peer at all) is just as real a documentation gap as an unchecked narrative mention -- FAIL both directions, same severity. Do NOT treat 'checked as present but never described' as automatically fine just because the rule used to read one-directionally. Same reasoning as SN-97151-05 otherwise.",
       "active": true
     },
     {
@@ -344,11 +344,11 @@
       "description": "If two sessions occur on the same day with different locations, is there at least a 15-minute break between them?",
       "type": "Default",
       "severity": "Normal",
-      "check_type": "not_checkable",
+      "check_type": "deterministic",
       "needs_history": false,
       "flag": null,
       "conditional_on": null,
-      "notes": "Needs this person's OTHER same-day session document(s) (for the cumulative/overlap check) — review_person_document operates on one document at a time; not available until a caller passes sibling-document data (Phase 3+).",
+      "notes": "Turns out NOT to need a sibling PersonDocument at all — the Activity Statement cover page already lists every billable row for this date (start/end time + location each) in one place. See fields.py::_check_same_day_location_break / activity_statement.py. not_applicable when there's only one billable session that day (nothing to compare); not_checkable only when no Activity Statement data is recorded for this batch at all.",
       "active": true
     },
     {
@@ -578,11 +578,11 @@
       "description": "Do the note's start time, end time, date of service, and location align with the timesheet?",
       "type": "Default",
       "severity": "Normal",
-      "check_type": "not_checkable",
+      "check_type": "deterministic",
       "needs_history": false,
       "flag": null,
       "conditional_on": null,
-      "notes": "Needs a timesheet — a second data source not yet available to this pipeline (flagged, not guessed at, per CLAUDE.md's honesty discipline). NOT YET VERIFIED against a real 97155 sample — none exists in agent-making/agent/tests/fixtures/ today; spot-check this checker's assumptions the first time a real 97155 document is available.",
+      "notes": "Same mechanism as SN-97151-04/SN-97153-04 — see fields.py::_check_timesheet_alignment / activity_statement.py. NOT YET VERIFIED against a real 97155 sample — none exists in agent-making/agent/tests/fixtures/ today; spot-check this checker's assumptions the first time a real 97155 document is available.",
       "active": true
     },
     {
@@ -666,14 +666,14 @@
     {
       "rule_id": "SN-97155-12",
       "service_code": "97155",
-      "description": "If the BT was listed in the narrative, were they listed as present in session participants?",
+      "description": "Does the session summary's account of the BT's presence agree with the session participants section, in both directions — if the BT is mentioned in the narrative are they also checked as present, AND if the BT is checked as present are they also actually described in the narrative?",
       "type": "Default",
       "severity": "Normal",
       "check_type": "judgment",
       "needs_history": false,
       "flag": null,
       "conditional_on": null,
-      "notes": "Same reasoning as SN-97151-05. NOT YET VERIFIED against a real 97155 sample — none exists in agent-making/agent/tests/fixtures/ today; spot-check this checker's assumptions the first time a real 97155 document is available.",
+      "notes": "DECIDED (real manual audit round, both directions confirmed as real violations worth flagging): checked-present with ZERO narrative support is just as real a gap as an unchecked narrative mention -- FAIL both directions, same severity. Same reasoning as SN-97151-05 otherwise. NOT YET VERIFIED against a real 97155 sample — none exists in agent-making/agent/tests/fixtures/ today; spot-check this checker's assumptions the first time a real 97155 document is available.",
       "active": true
     },
     {
@@ -721,11 +721,11 @@
       "description": "If two sessions occur on the same day with different locations, is there at least a 15-minute break between them?",
       "type": "Default",
       "severity": "Normal",
-      "check_type": "not_checkable",
+      "check_type": "deterministic",
       "needs_history": false,
       "flag": null,
       "conditional_on": null,
-      "notes": "Needs this person's OTHER same-day session document(s) (for the cumulative/overlap check) — review_person_document operates on one document at a time; not available until a caller passes sibling-document data (Phase 3+). NOT YET VERIFIED against a real 97155 sample — none exists in agent-making/agent/tests/fixtures/ today; spot-check this checker's assumptions the first time a real 97155 document is available.",
+      "notes": "Same mechanism as SN-97153-09 — turns out NOT to need a sibling PersonDocument, just this batch's own Activity Statement cover page (see fields.py::_check_same_day_location_break). NOT YET VERIFIED against a real 97155 sample — none exists in agent-making/agent/tests/fixtures/ today; spot-check this checker's assumptions the first time a real 97155 document is available.",
       "active": true
     },
     {

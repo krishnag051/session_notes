@@ -14,8 +14,11 @@ import { Route as AuditsRouteImport } from './routes/audits'
 import { Route as RulesRouteImport } from './routes/rules'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as UploadRouteImport } from './routes/upload'
+import { Route as UploadHistoryRouteImport } from './routes/upload-history'
 import { Route as AuditsIndexRouteImport } from './routes/audits.index'
 import { Route as AuditsAuditIdRouteImport } from './routes/audits.$auditId'
+import { Route as AuditsAuditIdIndexRouteImport } from './routes/audits.$auditId.index'
+import { Route as AuditsAuditIdExtractionRouteImport } from './routes/audits.$auditId.extraction'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -42,6 +45,11 @@ const UploadRoute = UploadRouteImport.update({
   path: '/upload',
   getParentRoute: () => rootRouteImport,
 } as any)
+const UploadHistoryRoute = UploadHistoryRouteImport.update({
+  id: '/upload-history',
+  path: '/upload-history',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AuditsIndexRoute = AuditsIndexRouteImport.update({
   id: '/',
   path: '/',
@@ -52,6 +60,16 @@ const AuditsAuditIdRoute = AuditsAuditIdRouteImport.update({
   path: '/$auditId',
   getParentRoute: () => AuditsRoute,
 } as any)
+const AuditsAuditIdIndexRoute = AuditsAuditIdIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => AuditsAuditIdRoute,
+} as any)
+const AuditsAuditIdExtractionRoute = AuditsAuditIdExtractionRouteImport.update({
+  id: '/extraction',
+  path: '/extraction',
+  getParentRoute: () => AuditsAuditIdRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -59,16 +77,21 @@ export interface FileRoutesByFullPath {
   '/rules': typeof RulesRoute
   '/settings': typeof SettingsRoute
   '/upload': typeof UploadRoute
-  '/audits/$auditId': typeof AuditsAuditIdRoute
+  '/upload-history': typeof UploadHistoryRoute
+  '/audits/$auditId': typeof AuditsAuditIdRouteWithChildren
   '/audits/': typeof AuditsIndexRoute
+  '/audits/$auditId/extraction': typeof AuditsAuditIdExtractionRoute
+  '/audits/$auditId/': typeof AuditsAuditIdIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/rules': typeof RulesRoute
   '/settings': typeof SettingsRoute
   '/upload': typeof UploadRoute
-  '/audits/$auditId': typeof AuditsAuditIdRoute
+  '/upload-history': typeof UploadHistoryRoute
   '/audits': typeof AuditsIndexRoute
+  '/audits/$auditId/extraction': typeof AuditsAuditIdExtractionRoute
+  '/audits/$auditId': typeof AuditsAuditIdIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -77,8 +100,11 @@ export interface FileRoutesById {
   '/rules': typeof RulesRoute
   '/settings': typeof SettingsRoute
   '/upload': typeof UploadRoute
-  '/audits/$auditId': typeof AuditsAuditIdRoute
+  '/upload-history': typeof UploadHistoryRoute
+  '/audits/$auditId': typeof AuditsAuditIdRouteWithChildren
   '/audits/': typeof AuditsIndexRoute
+  '/audits/$auditId/extraction': typeof AuditsAuditIdExtractionRoute
+  '/audits/$auditId/': typeof AuditsAuditIdIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -88,10 +114,21 @@ export interface FileRouteTypes {
     | '/rules'
     | '/settings'
     | '/upload'
+    | '/upload-history'
     | '/audits/$auditId'
     | '/audits/'
+    | '/audits/$auditId/extraction'
+    | '/audits/$auditId/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/rules' | '/settings' | '/upload' | '/audits/$auditId' | '/audits'
+  to:
+    | '/'
+    | '/rules'
+    | '/settings'
+    | '/upload'
+    | '/upload-history'
+    | '/audits'
+    | '/audits/$auditId/extraction'
+    | '/audits/$auditId'
   id:
     | '__root__'
     | '/'
@@ -99,8 +136,11 @@ export interface FileRouteTypes {
     | '/rules'
     | '/settings'
     | '/upload'
+    | '/upload-history'
     | '/audits/$auditId'
     | '/audits/'
+    | '/audits/$auditId/extraction'
+    | '/audits/$auditId/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -109,6 +149,7 @@ export interface RootRouteChildren {
   RulesRoute: typeof RulesRoute
   SettingsRoute: typeof SettingsRoute
   UploadRoute: typeof UploadRoute
+  UploadHistoryRoute: typeof UploadHistoryRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -148,6 +189,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof UploadRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/upload-history': {
+      id: '/upload-history'
+      path: '/upload-history'
+      fullPath: '/upload-history'
+      preLoaderRoute: typeof UploadHistoryRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/audits/': {
       id: '/audits/'
       path: '/'
@@ -162,16 +210,44 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuditsAuditIdRouteImport
       parentRoute: typeof AuditsRoute
     }
+    '/audits/$auditId/': {
+      id: '/audits/$auditId/'
+      path: '/'
+      fullPath: '/audits/$auditId/'
+      preLoaderRoute: typeof AuditsAuditIdIndexRouteImport
+      parentRoute: typeof AuditsAuditIdRoute
+    }
+    '/audits/$auditId/extraction': {
+      id: '/audits/$auditId/extraction'
+      path: '/extraction'
+      fullPath: '/audits/$auditId/extraction'
+      preLoaderRoute: typeof AuditsAuditIdExtractionRouteImport
+      parentRoute: typeof AuditsAuditIdRoute
+    }
   }
 }
 
+interface AuditsAuditIdRouteChildren {
+  AuditsAuditIdExtractionRoute: typeof AuditsAuditIdExtractionRoute
+  AuditsAuditIdIndexRoute: typeof AuditsAuditIdIndexRoute
+}
+
+const AuditsAuditIdRouteChildren: AuditsAuditIdRouteChildren = {
+  AuditsAuditIdExtractionRoute: AuditsAuditIdExtractionRoute,
+  AuditsAuditIdIndexRoute: AuditsAuditIdIndexRoute,
+}
+
+const AuditsAuditIdRouteWithChildren = AuditsAuditIdRoute._addFileChildren(
+  AuditsAuditIdRouteChildren,
+)
+
 interface AuditsRouteChildren {
-  AuditsAuditIdRoute: typeof AuditsAuditIdRoute
+  AuditsAuditIdRoute: typeof AuditsAuditIdRouteWithChildren
   AuditsIndexRoute: typeof AuditsIndexRoute
 }
 
 const AuditsRouteChildren: AuditsRouteChildren = {
-  AuditsAuditIdRoute: AuditsAuditIdRoute,
+  AuditsAuditIdRoute: AuditsAuditIdRouteWithChildren,
   AuditsIndexRoute: AuditsIndexRoute,
 }
 
@@ -184,6 +260,7 @@ const rootRouteChildren: RootRouteChildren = {
   RulesRoute: RulesRoute,
   SettingsRoute: SettingsRoute,
   UploadRoute: UploadRoute,
+  UploadHistoryRoute: UploadHistoryRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

@@ -45,6 +45,49 @@ def test_reconcile_majority_vote_prefers_an_entry_with_a_real_page():
     assert reconciled["R-1"]["page"] == 12
 
 
+def test_reconcile_majority_vote_prefers_fail_over_uncertain_when_fail_is_strict_plurality():
+    """Real bug (Cazi 97151/SN-97151-09): 3-of-5 judges said fail, 2 said
+    uncertain -- below the 4-of-5 bar, but zero judges said pass. The old
+    reconciliation discarded this real majority as a blanket "uncertain";
+    an "uncertain" vote isn't evidence FOR passing, so fail (the only
+    committed verdict, and the plurality) should win."""
+    all_results = [
+        {"R-1": _finding("fail")},
+        {"R-1": _finding("fail")},
+        {"R-1": _finding("fail")},
+        {"R-1": _finding("uncertain")},
+        {"R-1": _finding("uncertain")},
+    ]
+    reconciled = judge_module._reconcile_majority_vote(all_results, min_agreement=4)
+    assert reconciled["R-1"]["result"] == "fail"
+
+
+def test_reconcile_majority_vote_still_falls_back_to_uncertain_on_an_exact_fail_uncertain_tie():
+    all_results = [{"R-1": _finding("fail")} for _ in range(2)] + [{"R-1": _finding("uncertain")} for _ in range(2)]
+    reconciled = judge_module._reconcile_majority_vote(all_results, min_agreement=3)
+    assert reconciled["R-1"]["result"] == "uncertain"
+
+
+def test_reconcile_majority_vote_still_falls_back_to_uncertain_when_a_real_pass_vote_exists():
+    """A genuine pass-vs-fail disagreement (a real question about which
+    way this goes) must stay untouched -- any pass vote at all means this
+    isn't the narrow "fail vs hedging" case the fix targets."""
+    all_results = [
+        {"R-1": _finding("fail")},
+        {"R-1": _finding("fail")},
+        {"R-1": _finding("uncertain")},
+        {"R-1": _finding("pass")},
+    ]
+    reconciled = judge_module._reconcile_majority_vote(all_results, min_agreement=3)
+    assert reconciled["R-1"]["result"] == "uncertain"
+
+
+def test_two_way_uncertain_finding_still_uncertain_on_an_exact_tie():
+    f, s = _finding("fail"), _finding("uncertain")
+    result = judge_module._two_way_uncertain_finding(f, s)
+    assert result["result"] == "uncertain"
+
+
 def test_reconcile_majority_vote_only_reconciles_rule_ids_present_in_every_call():
     all_results = [
         {"R-1": _finding("pass"), "R-2": _finding("pass")},

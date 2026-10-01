@@ -23,11 +23,15 @@ class _FakeUsage:
 
 
 class _FakeResult:
-    def __init__(self, findings, api_calls=2, cost=0.01, status="complete", error=None):
+    def __init__(self, findings, api_calls=2, cost=0.01, status="complete", error=None, error_type=None):
         self.status = status
         self.findings = findings
         self.usage = _FakeUsage(api_calls, cost)
         self.error = error
+        # "cap_exceeded" (non-retryable) vs "unexpected" (the backend's own
+        # retry loop retries this one) — see app/routers/person_documents.py
+        # ::run_review and agent-making's ReviewResult.error_type docstring.
+        self.error_type = error_type or ("cap_exceeded" if status == "error" else None)
 
 
 def _fake_findings(overrides: dict | None = None) -> dict:
@@ -146,7 +150,7 @@ def test_reviewing_a_document_never_counts_it_as_its_own_history(client, monkeyp
 
     captured = []
 
-    def _fake_review(pdf_path, service_code, *, prior_extractions=None, model_override=None):
+    def _fake_review(pdf_path, service_code, *, prior_extractions=None, model_override=None, timesheet_rows=None, appendix=None, sibling_documents=None, max_spend_usd=None):
         captured.append(prior_extractions)
         return _FakeResult(_fake_findings())
 
@@ -220,10 +224,37 @@ def test_get_latest_review_returns_most_recent(client, monkeypatch):
     assert resp.json()["person_document_id"] == doc["id"]
 
 
-def test_get_latest_review_404_when_none_exists(client):
+def test_get_latest_review_pending_right_after_upload(client):
+    """Batch upload now creates a pending review row (and queues its real
+    run) for every confidently-classified document immediately — see
+    POST /batches — so "no review yet" is no longer true the instant
+    after upload the way it was before this phase; this replaces the old
+    "404 when none exists" case (see the unresolved-document test below
+    for the genuine 404 case that still exists)."""
     batch = _upload_batch(client, "batch_19page_3client.pdf")
     doc = next(d for d in batch["documents"] if d["service_code"] == "97153")
     resp = client.get(f"/api/person-documents/{doc['id']}/review")
+    assert resp.status_code == 200
+    # No mocking active in this test, so the auto-triggered background run
+    # already hit the (blocked-by-default) real call site and failed —
+    # itself proof the auto-review wiring actually ran, not a "we forgot
+    # to check" gap.
+    assert resp.json()["status"] == "failed"
+
+
+def test_get_latest_review_404_for_unresolved_document_with_no_review_row(client, db_session):
+    from app.db.models import PersonDocument
+
+    batch = _upload_batch(client, "batch_19page_3client.pdf")
+    unresolved = PersonDocument(
+        batch_id=batch["id"], person_id=None, service_code=None, date_of_service=None,
+        appendix=None, page_start=1, page_end=1, classification_confidence="unresolved",
+        classification_note="synthetic, for this test only",
+    )
+    db_session.add(unresolved)
+    db_session.commit()
+
+    resp = client.get(f"/api/person-documents/{unresolved.id}/review")
     assert resp.status_code == 404
 
 

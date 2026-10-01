@@ -85,6 +85,34 @@ schema exists, but the substance is decided, not tentative:
   goes through an explicit "merge/split person" operation with its own audit
   trail, not a raw field edit.
 
+## The Activity Statement is a real, always-available second data source (2026-09-29)
+
+The "Activity Statement - <name>" cover page that `classify_batch.py`
+already scans to split a batch PDF into per-person page ranges is not a
+throwaway boundary marker — it's a real, structured per-session timesheet
+(Date / Time / Provider / Client / Service / Location per row) for that
+person, already sitting in the same uploaded batch PDF. It is available for
+every batch, every time, with no separate upload step.
+
+Any rule whose question is answerable from (a) the session note document
+itself or (b) this Activity Statement — e.g. "do the note's start time, end
+time, date of service and location align with the timesheet?" or "is there
+a 15-minute break between same-day sessions at different locations?" —
+must resolve to a real pass/fail against the actual parsed rows (see
+`agent-making/agent/pipeline/activity_statement.py` and
+`fields.py::_check_timesheet_alignment`), never default to `not_checkable`
+on the assumption that no timesheet is available. That assumption was true
+early in this project and is no longer true — don't let a future task or a
+stale comment resurrect it.
+
+This does **not** weaken the anti-guessing discipline below.
+`not_checkable`/`uncertain`/`not_applicable` remains exactly correct
+whenever a rule needs something genuinely outside both (a) and (b) above —
+a prior session note or a prior Treatment Plan version that doesn't exist
+yet for this patient, for instance. The correction is narrow: don't call
+data "unavailable" when it's actually the Activity Statement sitting right
+there in the batch.
+
 ## When something in a task conflicts with an invariant above
 
 Stop and say so — don't silently pick a side. This is a healthcare-compliance

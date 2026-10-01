@@ -27,7 +27,59 @@ class Settings(BaseSettings):
     rule_engine_max_calls: int = 50
     rule_engine_max_spend_usd: float = 4.00
 
+    # A SEPARATE, batch-cumulative cap — distinct from rule_engine_max_spend_usd
+    # above (which bounds a single document's own review call). This one
+    # bounds the running total across an ENTIRE batch's auto-triggered
+    # reviews (see app/services/batch_reviews.py): once already-completed
+    # documents in a batch have spent this much, remaining pending
+    # documents are marked status="skipped_spend_cap" rather than started —
+    # same $4 default as the per-document cap today, but a real, separate
+    # number an operator may want to size differently once real batches
+    # (not just single test uploads) are actually running live.
+    batch_max_spend_usd: float = 4.00
+
+    # session_note_extraction.py's own call tracker (agent-making's
+    # CallTracker) now DOES estimate real cost, per-provider (Haiku
+    # fallback priced at Haiku's own rate, never Sonnet's — see
+    # model_provider.CallTracker.estimated_cost_usd) — folded into
+    # SessionNoteReview.spend_usd alongside review_person_document's own
+    # cost, so batch_max_spend_usd's running total now reflects BOTH real
+    # calls a document's review makes, not just the rule-checking one.
+    # (Previously a known gap where this call's cost was invisible to the
+    # cap — closed this phase.)
+    session_note_extraction_max_calls: int = 3
+
+    # The post-review humanization pass (agent-making's humanize.py::
+    # humanize_findings_batch, via app/agent_client.py) -- one real Haiku
+    # call per finding, run AFTER rule-checking completes, replacing the
+    # old client-side string-truncation heuristic. A real document today
+    # has ~15-40 findings; 60 is comfortable headroom without being
+    # effectively unbounded.
+    humanize_max_calls: int = 60
+
+    # HARD, ENFORCED ceiling on ONE document's total real spend, across
+    # ALL THREE real call stages combined (extraction + review + humanize)
+    # — urgent production ask after a review-time regression: "no single
+    # session note's review may spend more than $2 in real API cost...
+    # an actual enforced limit, not just a monitoring/alert". Each stage
+    # in run_review gets only its own REMAINING headroom under this
+    # ceiling as ITS OWN max_spend_usd (never the full $2, and never the
+    # flat rule_engine_max_spend_usd/session_note extraction caps above,
+    # which this can only ever tighten, never loosen) — so the three
+    # stages combined structurally cannot exceed this number.
+    per_document_hard_cap_usd: float = 2.00
+
     upload_storage_dir: str = "./data/uploads"
+
+    # A document's review failing with an UNEXPECTED exception (not
+    # review_person_document's own structured status="error" reporting,
+    # e.g. a spend-cap hit — that's left alone, retrying it wouldn't help)
+    # gets this many automatic retries before landing in a permanent
+    # "failed" state — a transient failure (a flaky real-API response, a
+    # momentary network blip) shouldn't require a human to notice and
+    # manually re-trigger it. See run_review's own retry loop.
+    review_retry_attempts: int = 2
+    review_retry_backoff_seconds: float = 2.0
 
     # Audit Flags (PASSED/FAILED) is a threshold on SessionNoteReview.score,
     # not "any single fail = fail" — real Brellium screenshots show 76%

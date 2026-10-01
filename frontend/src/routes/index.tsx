@@ -6,8 +6,8 @@ import { getAuditSummary, listAudits } from "@/lib/api";
 
 export const Route = createFileRoute("/")({
   loader: async () => {
-    const [summary, audits] = await Promise.all([getAuditSummary(), listAudits()]);
-    return { summary, recent: audits.slice(0, 10) };
+    const [summary, audits] = await Promise.all([getAuditSummary(), listAudits({ pageSize: 10 })]);
+    return { summary, recent: audits.items };
   },
   head: () => ({
     meta: [

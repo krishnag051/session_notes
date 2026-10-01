@@ -4,6 +4,7 @@ import {
   UploadCloud,
   ClipboardCheck,
   ListChecks,
+  History,
   Settings as SettingsIcon,
 } from "lucide-react";
 
@@ -11,6 +12,7 @@ const NAV = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, exact: true },
   { to: "/upload", label: "Upload", icon: UploadCloud },
   { to: "/audits", label: "Audits", icon: ClipboardCheck },
+  { to: "/upload-history", label: "Upload History", icon: History },
   { to: "/rules", label: "Rules", icon: ListChecks },
   { to: "/settings", label: "Settings", icon: SettingsIcon },
 ] as const;

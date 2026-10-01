@@ -11,6 +11,12 @@ implemented yet rather than guessing.
     "full_text": str,                 # all pages joined
     "service_code": str,              # "97151" | "97153" | "97155"
     "person": {"full_name": str, "dob": str},
+    "timesheet_rows": list[dict] | None,  # this batch's Activity Statement rows, see activity_statement.py
+    "appendix": str | None,               # this document's own appendix — the join key into timesheet_rows
+    "sibling_documents": list[dict] | None,  # this person's OTHER documents from the SAME batch/upload —
+                                              # [{"service_code": str, "full_text": str}, ...] — for any rule
+                                              # phrased as "at least one session note" (not scoped to a
+                                              # specific assessment/service type), see _check_SN_97151_11.
 }
 """
 from __future__ import annotations
@@ -18,7 +24,30 @@ from __future__ import annotations
 import re
 from datetime import date, datetime, timedelta
 
+from . import activity_statement as _activity_statement_module
+
 # --------------------------------------------------------------- helpers
+
+# Real bug found via a real manual audit (Charny Gluck/Udy Reichman,
+# SN-97153-15): a multi-page note reprints the SAME patient-identifying
+# header block ("Patient Name: ... Insurance ID: ... \n \nPage N of M...")
+# at the top of every page after the first. When "Session Summary"/
+# "Session Narrative:" happens to land right at a page boundary (real,
+# confirmed case: the header literally ends the page, with zero narrative
+# content before the reprint), a naive "(.*?)(?:\nProvider Name:|\nPatient
+# Name:)" search stops at THIS reprinted header — not the real end of the
+# section — because it's also a "\nPatient Name:" occurrence, producing an
+# empty or near-empty captured narrative. Stripped out BEFORE narrative
+# extraction so the real section-boundary search only ever sees the ONE
+# genuine "\nPatient Name:"/"\nProvider Name:" that actually ends the note.
+_PAGE_BREAK_HEADER_RE = re.compile(
+    r"\n?Patient Name:.*?Insurance ID:[^\n]*\n\s*\nPage \d+ of \d+[^\n]*\n", re.DOTALL,
+)
+
+
+def _strip_page_break_headers(text: str) -> str:
+    return _PAGE_BREAK_HEADER_RE.sub("\n", text)
+
 
 _TELEHEALTH_PLATFORM_KEYWORDS = ("zoom", "google meet", "microsoft teams", "facetime", "skype", "webex", "doxy.me")
 _NAP_SLEEP_SICKNESS_KEYWORDS = ("nap", "asleep", "sleepy", "sleeping", "sick", "illness", "fever")
@@ -175,6 +204,31 @@ def sentence_count(text: str) -> int:
     return len(re.findall(r"[.!?]+(?:\s|$)", stripped)) or (1 if stripped else 0)
 
 
+def _counted_sentences(text: str) -> list[str]:
+    """Splits on the SAME boundary sentence_count() itself counts on — the
+    actual sentence fragments, so a remark can show a reader exactly what
+    was counted, not just a bare number they have no way to verify."""
+    return [p.strip() for p in re.split(r"(?<=[.!?])\s+", text.strip()) if p.strip()]
+
+
+def _sentence_count_excerpt(text: str) -> str:
+    """Real bug found via a real manual audit: this rule's remark used to
+    be a bare count ("1 sentence(s) across 2.75h...") with no way to see
+    WHICH text was counted — across several real documents sharing a
+    near-identical template, counts swung wildly (1 vs. 15 vs. 21),
+    impossible to sanity-check without seeing the underlying sentences.
+    Quotes every counted sentence when there are few enough to read at a
+    glance; otherwise just the first and last, so a reader can still spot
+    an obviously-wrong split without reading the whole narrative."""
+    sentences = _counted_sentences(text)
+    if not sentences:
+        return ""
+    if len(sentences) <= 5:
+        quoted = "; ".join(f'"{s}"' for s in sentences)
+        return f" Counted: {quoted}"
+    return f' Counted (first): "{sentences[0]}" ... (last): "{sentences[-1]}"'
+
+
 def _keyword_hit(text: str, keywords: tuple[str, ...]) -> str | None:
     lowered = text.lower()
     for kw in keywords:
@@ -201,9 +255,18 @@ def _narrative_section_text(fields: dict) -> str | None:
     Session Duration was being extracted successfully by other checkers
     in the very same run. Tries every known header in turn rather than
     assuming a fixed one.
+
+    BUG FIX (real manual audit, Charny Gluck/Udy Reichman): page-break
+    header reprints are stripped BEFORE this search — see
+    _strip_page_break_headers's own docstring. Without this, a narrative
+    that happens to start right at a page boundary gets cut to empty/
+    near-empty by the reprinted header looking like the section's own end
+    boundary, even though the real narrative (and a real Session Duration
+    elsewhere on the page) are both genuinely present and readable.
     """
+    full_text = _strip_page_break_headers(fields["full_text"])
     for header in _NARRATIVE_SECTION_HEADERS:
-        m = _search(rf"{re.escape(header)}(.*?)(?:\nProvider Name:|\nPatient Name:)", fields["full_text"], re.DOTALL)
+        m = _search(rf"{re.escape(header)}(.*?)(?:\nProvider Name:|\nPatient Name:)", full_text, re.DOTALL)
         if m:
             return m.group(1)
     return None
@@ -300,25 +363,50 @@ def _check_SN_97151_10(fields: dict) -> dict:
     )
 
 
-def _assessment_activities_block(fields: dict) -> str:
+def _assessment_activities_block_from_text(full_text: str) -> str:
     m = _search(
         r"Assessment Activities:(.*?)(?:\nSession Narrative:|\nProvider Name:|\nPatient Name:)",
-        fields["full_text"], re.DOTALL,
+        full_text, re.DOTALL,
     )
     return m.group(1) if m else ""
 
 
+def _assessment_activities_block(fields: dict) -> str:
+    return _assessment_activities_block_from_text(fields["full_text"])
+
+
 _GOAL_DEVELOPMENT_RE = re.compile(r"\bgoal\b[^.\n]{0,30}\b(develop|updat)", re.IGNORECASE | re.DOTALL)
+# Sibling-fallback only, deliberately NOT used for this document's own
+# primary check above (keeps that check's existing behavior unchanged —
+# see this phase's own "nothing else changed" scope). A non-assessment
+# template (e.g. Parent Training/97156) has no "Assessment Activities"
+# block and doesn't phrase things as "goal development/updating" at all —
+# real fixture text shows it instead under a "Parent Goals Addressed"
+# section header, with extensive per-goal data-point detail underneath.
+# That header IS goal development/updating being documented, just under a
+# different template's own heading.
+_GOAL_SECTION_HEADER_RE = re.compile(r"\bGoals?\s+Addressed\b", re.IGNORECASE)
 
 
 def _check_SN_97151_11(fields: dict) -> dict:
     """Reclassified from judgment to deterministic (Phase 2, follow-up
     round) — real sample PDFs show 'goal development/updating' maps
     directly onto the Assessment Activities block's own 'Treatment plan
-    development' checkbox, no interpretation needed. Same single-document
-    'at least one' scope limitation as SN-97151-10: a checked box in THIS
-    document conclusively satisfies the rule, but its absence here can't
-    rule out another of this person's assessment documents.
+    development' checkbox, no interpretation needed.
+
+    UNLIKE SN-97151-10 (scoped to "at least one ASSESSMENT session" —
+    genuinely single-document, since a Parent Training sibling isn't an
+    assessment document), this rule's own question is "at least one
+    SESSION NOTE" — not scoped to any specific service/assessment type.
+    Real bug found via a real Cazi 97151/97156 CSV audit: a sibling
+    Parent Training (97156) document in the SAME batch/upload already
+    covers "Parent Goals Addressed" in detail, but this check only ever
+    looked at the one document being reviewed and fell back to
+    not_checkable — the same "pipeline forgot a real second source was
+    already sitting in the same upload" shape as the Activity Statement/
+    timesheet fix. Checks this document first, then every sibling from
+    the same batch (see `fields["sibling_documents"]`) before falling
+    back to not_checkable.
     """
     block = _assessment_activities_block(fields)
     if _search(r"☑\s*Treatment plan development", block):
@@ -328,15 +416,72 @@ def _check_SN_97151_11(fields: dict) -> dict:
         )
     if _GOAL_DEVELOPMENT_RE.search(fields["full_text"]):
         return _pass("Narrative mentions goal development/updating language in this document.")
+
+    for sibling in fields.get("sibling_documents") or []:
+        sibling_text = sibling.get("full_text") or ""
+        sibling_code = sibling.get("service_code") or "other"
+        sibling_block = _assessment_activities_block_from_text(sibling_text)
+        if _search(r"☑\s*Treatment plan development", sibling_block):
+            return _pass(
+                f"Assessment Activities checkbox 'Treatment plan development' is checked in this person's "
+                f"{sibling_code} document from the same upload (this rule asks about 'at least one' session "
+                f"note, not a specific service type)."
+            )
+        if _GOAL_DEVELOPMENT_RE.search(sibling_text):
+            return _pass(
+                f"This person's {sibling_code} document from the same upload mentions goal development/"
+                f"updating language (this rule asks about 'at least one' session note, not a specific "
+                f"service type)."
+            )
+        if _GOAL_SECTION_HEADER_RE.search(sibling_text):
+            return _pass(
+                f"This person's {sibling_code} document from the same upload has its own 'Goals Addressed' "
+                f"section with goal-level detail (this rule asks about 'at least one' session note, not a "
+                f"specific service type)."
+            )
+
     return _not_checkable(
         "Neither the 'Treatment plan development' checkbox nor goal development/updating language was found "
-        "in THIS document — but this rule asks about 'at least one' of this person's assessment sessions, "
-        "which this single-document check cannot rule out on its own."
+        "in this document or in any of this person's sibling documents from the same upload — this rule asks "
+        "about 'at least one' of this person's session notes, which this batch's own documents don't confirm "
+        "either way."
     )
 
 
+_QUOTED_GOAL_CITATION_RE = re.compile(r'"[^"]*?",?\s*patient required[^.\n]*\.', re.IGNORECASE | re.DOTALL)
+
+
+def _nap_sleep_sickness_search_text(fields: dict) -> str:
+    """Real bug found via a real manual audit (Shea Herskovic,
+    SN-97153-19): the keyword search used to scan effectively the WHOLE
+    document (_narrative_text only excludes the Participants checkbox
+    block) — including the Goals/data-points section, which is largely
+    templated, illustrative EXAMPLE text describing what each goal
+    measures (confirmed real text: "...client will discriminate between a
+    'who/what/where' question..., where is the baby sleeping, who is
+    sleeping in the crib etc."), not a statement that the patient was
+    actually napping/sick during the billed session.
+
+    Scoped to just the real Session Summary/Session Narrative (see
+    _narrative_section_text) — which already excludes the raw Goals/
+    data-points block entirely, since that block always comes BEFORE this
+    section header. The Session Summary itself still separately re-quotes
+    each goal's own description verbatim (the templated "Some of the
+    goals worked on today were: '<goal description>', patient required X
+    with this goal." block) — those quoted citations are stripped too,
+    for the same reason: goal-definition text, not a real account of what
+    happened in session. Falls back to the old, looser _narrative_text
+    scope (whole document minus the Participants block) only when no
+    narrative section can be found at all, preserving prior behavior for
+    whatever document shape that was built for.
+    """
+    narrative = _narrative_section_text(fields)
+    text = narrative if narrative is not None else _narrative_text(fields)
+    return _QUOTED_GOAL_CITATION_RE.sub(" ", text)
+
+
 def _check_SN_97151_12(fields: dict) -> dict:
-    hit = _keyword_hit(_narrative_text(fields), _NAP_SLEEP_SICKNESS_KEYWORDS)
+    hit = _keyword_hit(_nap_sleep_sickness_search_text(fields), _NAP_SLEEP_SICKNESS_KEYWORDS)
     if hit:
         return _fail(f"Note contains a reference to '{hit}'.", page=_page_of(fields, hit))
     return _pass("No reference to nap/sleep or sickness found.")
@@ -438,9 +583,10 @@ def _check_SN_97153_15(fields: dict) -> dict:
         return _uncertain("Could not find both a session narrative and a usable Session Duration.")
     count = sentence_count(narrative)
     rate = count / hours
+    excerpt = _sentence_count_excerpt(narrative)
     if rate >= 3:
-        return _pass(f"{count} sentence(s) across {hours:.2f}h ({rate:.1f}/h) meets the 3/h minimum.")
-    return _fail(f"{count} sentence(s) across {hours:.2f}h ({rate:.1f}/h) is under the 3/h minimum.")
+        return _pass(f"{count} sentence(s) across {hours:.2f}h ({rate:.1f}/h) meets the 3/h minimum.{excerpt}")
+    return _fail(f"{count} sentence(s) across {hours:.2f}h ({rate:.1f}/h) is under the 3/h minimum.{excerpt}")
 
 
 def _check_SN_97153_16(fields: dict) -> dict:
@@ -530,9 +676,10 @@ def _check_SN_97155_18(fields: dict) -> dict:
         return _uncertain("Could not find both a session narrative and a usable Session Duration.")
     count = sentence_count(narrative)
     rate = count / hours
+    excerpt = _sentence_count_excerpt(narrative)
     if rate >= 5:
-        return _pass(f"{count} sentence(s) across {hours:.2f}h ({rate:.1f}/h) meets the 5/h minimum.")
-    return _fail(f"{count} sentence(s) across {hours:.2f}h ({rate:.1f}/h) is under the 5/h minimum.")
+        return _pass(f"{count} sentence(s) across {hours:.2f}h ({rate:.1f}/h) meets the 5/h minimum.{excerpt}")
+    return _fail(f"{count} sentence(s) across {hours:.2f}h ({rate:.1f}/h) is under the 5/h minimum.{excerpt}")
 
 
 def _check_SN_97155_19(fields: dict) -> dict:
@@ -545,6 +692,167 @@ def _check_SN_97155_23(fields: dict) -> dict:
 
 def _check_SN_97155_25(fields: dict) -> dict:
     return _check_SN_97151_12(fields)
+
+
+# ------------------------------------------------- Activity Statement checks
+#
+# The real second data source these rules always needed was already sitting
+# in the same uploaded batch PDF, unused — see activity_statement.py's own
+# docstring. `fields["timesheet_rows"]` (every row parsed off this
+# document's own Activity Statement cover page) and `fields["appendix"]`
+# (this PersonDocument's own appendix, the reliable join key) are both
+# threaded in from the backend (see app/routers/person_documents.py's
+# run_review) — never guessed/derived here, just consumed.
+
+_TIME_HHMM_AMPM_RE = re.compile(r"(\d{1,2}):(\d{2})\s*([AP]M)", re.IGNORECASE)
+
+
+def _normalize_time_str(raw: str) -> str | None:
+    """'09:30 AM (EST)' or '9:30 AM' -> '9:30 AM' — strips timezone and
+    zero-padding so a note's own field and a timesheet row's field compare
+    equal regardless of which style each happened to print in."""
+    m = _TIME_HHMM_AMPM_RE.search(raw)
+    if not m:
+        return None
+    return f"{int(m.group(1))}:{m.group(2)} {m.group(3).upper()}"
+
+
+def _time_to_minutes(raw: str) -> int | None:
+    m = _TIME_HHMM_AMPM_RE.search(raw)
+    if not m:
+        return None
+    hour, minute, ampm = int(m.group(1)), int(m.group(2)), m.group(3).upper()
+    if ampm == "PM" and hour != 12:
+        hour += 12
+    if ampm == "AM" and hour == 12:
+        hour = 0
+    return hour * 60 + minute
+
+
+def _normalize_location_str(raw: str) -> str:
+    """'11 - Office' -> 'office' — strips a leading numeric location code
+    (the note's own field prints one, the timesheet's parsed field
+    doesn't) so only the actual place-of-service description is compared."""
+    return re.sub(r"^\s*\d{1,2}\s*[-:]\s*", "", raw).strip().lower()
+
+
+def _check_timesheet_alignment(fields: dict) -> dict:
+    """Shared by every '...align with the timesheet?' rule regardless of
+    service_code — the comparison itself doesn't vary by service_code,
+    only which document is being checked."""
+    rows = fields.get("timesheet_rows")
+    if not rows:
+        return _not_checkable(
+            "No Activity Statement/timesheet data was available for this document "
+            "(no cover page recorded for this batch, or it couldn't be parsed)."
+        )
+    appendix = fields.get("appendix")
+    row = _activity_statement_module.row_for_appendix(rows, appendix)
+    if row is None:
+        return _not_checkable(
+            f"No timesheet row on this Activity Statement references this document's own appendix "
+            f"({appendix or 'none recorded'}) — cannot confirm which row is this session's."
+        )
+
+    note_date = session_date(fields)
+    note_start = session_start_time(fields)
+    note_end = session_end_time(fields)
+    note_location = session_location(fields)
+
+    mismatches = []
+    if note_date is not None:
+        try:
+            timesheet_date = _parse_mmddyyyy(row["date"])
+            if note_date != timesheet_date:
+                mismatches.append(f"date of service (note: {note_date.isoformat()}, timesheet: {row['date']})")
+        except ValueError:
+            pass
+    if note_start and row.get("start_time"):
+        n, t = _normalize_time_str(note_start), _normalize_time_str(row["start_time"])
+        if n and t and n != t:
+            mismatches.append(f"start time (note: {n}, timesheet: {t})")
+    if note_end and row.get("end_time"):
+        n, t = _normalize_time_str(note_end), _normalize_time_str(row["end_time"])
+        if n and t and n != t:
+            mismatches.append(f"end time (note: {n}, timesheet: {t})")
+    if note_location and row.get("location"):
+        if _normalize_location_str(note_location) != _normalize_location_str(row["location"]):
+            mismatches.append(f"location (note: '{note_location}', timesheet: '{row['location']}')")
+
+    if mismatches:
+        return _fail("Mismatch against the Activity Statement timesheet: " + "; ".join(mismatches))
+    return _pass(
+        f"Start time ({note_start}), end time ({note_end}), date of service, and location all match the "
+        f"Activity Statement timesheet row for this session (Appendix {appendix})."
+    )
+
+
+def _check_SN_97151_04(fields: dict) -> dict:
+    return _check_timesheet_alignment(fields)
+
+
+def _check_SN_97153_04(fields: dict) -> dict:
+    return _check_timesheet_alignment(fields)
+
+
+def _check_SN_97155_05(fields: dict) -> dict:
+    # Same mechanism as the 97151/97153 versions above — real code, but
+    # NOT YET VERIFIED against a real 97155 sample (none exists in
+    # agent-making/agent/tests/fixtures/ today, per this rule's own
+    # pre-existing notes). Spot-check the first time a real 97155 document
+    # with an Activity Statement is available.
+    return _check_timesheet_alignment(fields)
+
+
+def _check_same_day_location_break(fields: dict) -> dict:
+    """'If two sessions occur on the same day with different locations, is
+    there at least a 15-minute break between them?' — this rule's own
+    pre-existing notes assumed it needed a SIBLING PersonDocument's own
+    text (Phase 3+ multi-document plumbing that doesn't exist). It
+    doesn't: the SAME Activity Statement cover page already lists every
+    billable row for the date in one place, with real start/end times and
+    locations — no sibling-document fetch needed at all."""
+    rows = fields.get("timesheet_rows")
+    if not rows:
+        return _not_checkable(
+            "No Activity Statement/timesheet data was available for this document."
+        )
+    billable = [r for r in rows if r.get("service_code") and r.get("start_time") and r.get("end_time")]
+    if len(billable) < 2:
+        return _not_applicable(
+            "Only one billable session is on this timesheet for this date — no other same-day session to compare against."
+        )
+
+    ordered = sorted(billable, key=lambda r: _time_to_minutes(r["start_time"]) or 0)
+    violations = []
+    for a, b in zip(ordered, ordered[1:]):
+        loc_a = _normalize_location_str(a["location"]) if a.get("location") else None
+        loc_b = _normalize_location_str(b["location"]) if b.get("location") else None
+        if not loc_a or not loc_b or loc_a == loc_b:
+            continue  # same location (or unknown) -- this rule only concerns a location CHANGE
+        end_a, start_b = _time_to_minutes(a["end_time"]), _time_to_minutes(b["start_time"])
+        if end_a is None or start_b is None:
+            continue
+        gap = start_b - end_a
+        if gap < 15:
+            violations.append(
+                f"only {gap} minute(s) between service {a.get('service_code')} (ends {a['end_time']}, "
+                f"{a['location']}) and service {b.get('service_code')} (starts {b['start_time']}, {b['location']})"
+            )
+
+    if violations:
+        return _fail("Same-day sessions at different locations without a 15-minute break: " + "; ".join(violations))
+    return _pass("All same-day sessions on this timesheet at different locations have at least a 15-minute break.")
+
+
+def _check_SN_97153_09(fields: dict) -> dict:
+    return _check_same_day_location_break(fields)
+
+
+def _check_SN_97155_16(fields: dict) -> dict:
+    # Same mechanism as SN-97153-09 above — NOT YET VERIFIED against a
+    # real 97155 sample (see that rule's own pre-existing notes).
+    return _check_same_day_location_break(fields)
 
 
 # --------------------------------------------------------------- dispatch
@@ -578,6 +886,11 @@ DETERMINISTIC_CHECKERS = {
     "SN-97155-19": _check_SN_97155_19,
     "SN-97155-23": _check_SN_97155_23,
     "SN-97155-25": _check_SN_97155_25,
+    "SN-97151-04": _check_SN_97151_04,
+    "SN-97153-04": _check_SN_97153_04,
+    "SN-97155-05": _check_SN_97155_05,
+    "SN-97153-09": _check_SN_97153_09,
+    "SN-97155-16": _check_SN_97155_16,
 }
 
 

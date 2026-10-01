@@ -64,6 +64,82 @@ def _blocked_review_person_document(*args, **kwargs):
     )
 
 
+def _blocked_extract_session_note_data(*args, **kwargs):
+    raise RuntimeError(
+        "BLOCKED by backend/tests/conftest.py::_block_real_api_calls: a test attempted to call "
+        "app.agent_client.extract_session_note_data — session_note_extraction.py's own real, "
+        "separately-billed model call, wired into the automatic per-batch review job in this phase. "
+        "Same guardrail, same escape hatch (@pytest.mark.real_api + explicit per-instance approval) as "
+        "review_person_document above — see that function's own blocked-call message for the full "
+        "policy this mirrors."
+    )
+
+
+def _maybe_fake_extract_session_note_data(*args, **kwargs):
+    """Guards the SAME real call site as `_blocked_extract_session_note_data`
+    above, but with one twist: dozens of pre-existing tests across this
+    suite already monkeypatch `review_person_document` (proving deliberate
+    intent to exercise a fully-mocked pipeline run) without also
+    monkeypatching this newer, second real call site this phase adds —
+    updating every one of those individually would be pure churn for a
+    change that doesn't touch what any of them actually assert. So: if
+    `review_person_document` is STILL the blocked default (i.e. this
+    specific test forgot to mock anything at all), this raises exactly
+    like the guardrail everywhere else — a genuinely unmocked test is
+    still caught, never silently allowed through. Only once a test has
+    already positively opted into a fake pipeline run does this one
+    quietly fake its own output too, rather than requiring the same
+    monkeypatch line copy-pasted at 13 call sites.
+    """
+    import app.routers.person_documents as person_documents_module
+
+    if person_documents_module.review_person_document is _blocked_review_person_document:
+        _blocked_extract_session_note_data(*args, **kwargs)
+    return {
+        "fields": {
+            "session_date": {"value": None, "confidence": "none", "source_quote": None},
+            "session_location": {"value": None, "confidence": "none", "source_quote": None},
+            "clinician_telehealth_location": {"value": None, "confidence": "none", "source_quote": None},
+            "patient_telehealth_location": {"value": None, "confidence": "none", "source_quote": None},
+            "assessment_activity": {"value": None, "confidence": "none", "source_quote": None},
+            "note_detail_level": {"value": None, "confidence": "none", "source_quote": None},
+        },
+        "api_calls_used": 0,
+        "api_cost_usd": 0.0,
+    }
+
+
+def _blocked_humanize_findings_batch(*args, **kwargs):
+    raise RuntimeError(
+        "BLOCKED by backend/tests/conftest.py::_block_real_api_calls: a test attempted to call "
+        "app.agent_client.humanize_findings_batch — the post-review humanization pass's own real, "
+        "separately-billed Haiku call per finding (run_review calls this unconditionally after ANY "
+        "successful review_person_document result). Same guardrail, same escape hatch "
+        "(@pytest.mark.real_api + explicit per-instance approval) as review_person_document above — "
+        "see that function's own blocked-call message for the full policy this mirrors."
+    )
+
+
+def _maybe_fake_humanize_findings_batch(texts, *, labels=None, **kwargs):
+    """Same reasoning as `_maybe_fake_extract_session_note_data` above:
+    dozens of pre-existing tests monkeypatch `review_person_document` to
+    return a successful FakeResult without knowing about this NEWER real
+    call site this phase adds — `run_review` reaches it unconditionally
+    after ANY successful result, mocked or not. If `review_person_document`
+    is STILL the blocked default (a genuinely unmocked test), this raises
+    exactly like the guardrail everywhere else. Otherwise falls back to a
+    zero-cost, deterministic fake: each text's own "humanized" text is
+    identical to its own raw text, so a mocked test's RuleResult.
+    model_finding/final_finding still lines up with whatever that test's
+    own mocked finding text was.
+    """
+    import app.routers.person_documents as person_documents_module
+
+    if person_documents_module.review_person_document is _blocked_review_person_document:
+        _blocked_humanize_findings_batch(texts, labels=labels, **kwargs)
+    return [(t, t, {}) for t in texts]
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
@@ -87,6 +163,8 @@ def _block_real_api_calls(request, monkeypatch):
     import app.routers.person_documents as person_documents_module
 
     monkeypatch.setattr(person_documents_module, "review_person_document", _blocked_review_person_document)
+    monkeypatch.setattr(person_documents_module, "extract_session_note_data", _maybe_fake_extract_session_note_data)
+    monkeypatch.setattr(person_documents_module, "humanize_findings_batch", _maybe_fake_humanize_findings_batch)
     yield
 
 

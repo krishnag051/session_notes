@@ -16,6 +16,7 @@ never a raw exception reaching the caller.
 from __future__ import annotations
 
 import json
+import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -64,6 +65,17 @@ class ReviewResult:
     needs_review: list = field(default_factory=list)
     usage: UsageInfo = field(default_factory=UsageInfo)
     error: str | None = None
+    # "cap_exceeded" (ApiCallCapExceeded/ApiSpendCapExceeded/IntegrityError —
+    # a deliberate limit; retrying changes nothing) vs "unexpected" (the
+    # blanket exception handler below — anything else, including a real,
+    # once-off SDK/library crash). Real bug found via a real production
+    # crash (PydanticUserError inside the real Anthropic call): before this
+    # field existed, BOTH buckets looked identical to a caller as
+    # status="error" with no way to tell "retrying this is pointless" apart
+    # from "this might just be transient" — the backend's own retry
+    # mechanism (app/routers/person_documents.py::run_review) reads this to
+    # decide whether to retry at all. None only for status="complete".
+    error_type: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -95,6 +107,9 @@ def review_person_document(
     max_calls: int | None = None,
     max_spend_usd: float | None = None,
     model_override: str | None = None,
+    timesheet_rows: list[dict] | None = None,
+    appendix: str | None = None,
+    sibling_documents: list[dict] | None = None,
 ) -> ReviewResult:
     """Reviews ONE person's ONE document (a single appendix/service-code
     document, per Phase 1's classify_person_docs.py — not a whole multi-
@@ -107,6 +122,27 @@ def review_person_document(
     for fetching these, never this function. `None`/empty means no history
     is available; every needs_history rule then resolves to not_checkable
     without ever reaching the judgment layer for that rule_id.
+
+    `timesheet_rows`/`appendix`: this document's OWN Activity Statement
+    cover page, already parsed into rows by activity_statement.py, plus
+    which row is this document's own (by appendix — a reliable join key,
+    not date/service_code guessing). Same statelessness convention as
+    prior_extractions: the caller (the backend) is responsible for slicing
+    the right cover page and parsing it — this function only consumes
+    already-parsed data. `None` means no Activity Statement data was
+    available for this batch; every timesheet-dependent rule then
+    resolves to an honest not_checkable, same as before this was wired up.
+
+    `sibling_documents`: this person's OTHER documents from the SAME
+    batch/upload (any service code), as plain data
+    (`[{"service_code": str, "full_text": str}, ...]`) — same
+    statelessness convention as prior_extractions/timesheet_rows: the
+    caller fetches and slices these, this function only consumes
+    already-extracted text. For any rule phrased as "at least one session
+    note" rather than scoped to a specific assessment/service type (see
+    fields.py::_check_SN_97151_11). `None`/empty means no sibling data was
+    available; that rule then resolves to not_checkable, same as before
+    this was wired up.
 
     `max_calls`/`max_spend_usd`: forwarded to this call's own
     ApiCallTracker — the only thing standing between "run this" and an
@@ -123,7 +159,11 @@ def review_person_document(
         full_text = "\n\n".join(p["text"] for p in pages)
         rules = [r for r in _load_rules() if r.get("service_code") == service_code]
 
-        fields = {"pages": pages, "full_text": full_text, "service_code": service_code}
+        fields = {
+            "pages": pages, "full_text": full_text, "service_code": service_code,
+            "timesheet_rows": timesheet_rows, "appendix": appendix,
+            "sibling_documents": sibling_documents,
+        }
 
         det_results, escalated_rules = fields_module.run_deterministic_checks(rules, fields)
 
@@ -187,6 +227,10 @@ def review_person_document(
             ),
         )
     except (ApiCallCapExceeded, ApiSpendCapExceeded, IntegrityError) as exc:
-        return ReviewResult(status="error", service_code=service_code, error=str(exc))
-    except Exception as exc:  # noqa: BLE001 — never let a raw exception reach the caller
-        return ReviewResult(status="error", service_code=service_code, error=f"{type(exc).__name__}: {exc}")
+        return ReviewResult(status="error", service_code=service_code, error=str(exc), error_type="cap_exceeded")
+    except Exception:  # noqa: BLE001 — never let a raw exception reach the caller
+        # The FULL traceback, not just str(exc) — the previous, message-
+        # only form made a real production crash (PydanticUserError:
+        # "BaseModel cannot be instantiated directly") undiagnosable after
+        # the fact, with no file/line pointing at the actual call site.
+        return ReviewResult(status="error", service_code=service_code, error=traceback.format_exc(), error_type="unexpected")

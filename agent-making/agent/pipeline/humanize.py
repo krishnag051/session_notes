@@ -219,6 +219,13 @@ _OUTPUT_COST_PER_MTOK = 5.00
 # citations are adjacent or where in the string they fall.
 _PLACEHOLDER_TEMPLATE = "PAGEREF{i}X"
 _PLACEHOLDER_RE = re.compile(r"PAGEREF(\d+)X")
+# Real bug found via a real manual audit round: a not_checkable rule's own
+# `evidence` is rules.json's own `notes` field verbatim (see api.py) --
+# this is the exact, recognizable shape of a developer-facing cross-
+# reference comment ("Same reasoning as SN-97151-17."), never a real
+# finding with its own facts to preserve. See humanize_evidence_with_llm's
+# own pre-call guard for why this is skipped before ever reaching the model.
+_CROSS_REFERENCE_ONLY_RE = re.compile(r"^Same reasoning as [A-Za-z0-9\-]+\.?$", re.IGNORECASE)
 
 _REWRITE_SYSTEM_PROMPT = (
     "You rewrite a compliance checklist's evidence text so it reads the way a BCBA would explain the finding "
@@ -243,7 +250,22 @@ _REWRITE_SYSTEM_PROMPT = (
     "Bad output (too long, too many joined clauses, even though it also keeps the facts): 'The patient is 17 "
     "years old and the authorization runs from 07/30/2026 to 10/30/2026 for 92 days, which is the right "
     "13-week range we'd expect for someone over 13.'\n"
-    "6. Output ONLY the rewritten text. No preamble, no quotes around it, nothing else."
+    "6. ALWAYS include the actual reason/conclusion, never just the setup fact. If the input has a contrast "
+    "structure ('X is true, but Y contradicts it' / 'X; however, Y'), the clause after 'but'/'however'/"
+    "'whereas'/'yet' is almost always the real reason this passed, failed, or came back uncertain -- it must "
+    "survive the rewrite even if you compress or drop part of the setup clause before it. A reader must be "
+    "able to tell WHY from your rewrite alone, not just see a neutral fact with no conclusion attached. Never "
+    "end mid-sentence, mid-question, or with a dangling open quote -- every rewrite is a complete thought.\n"
+    "7. Example with several names in one finding -- input: \"Only patient name 'Jane Doe' and AKA 'Janie' "
+    "appear. Provider 'Pat Smith' and BCBA 'Robin Lee' are labeled as providers, not treated as patient aliases.\" "
+    "Good output (every name stays with its own original role, nothing merged): \"Only Jane Doe and her AKA Janie "
+    "show up as the patient -- Pat Smith and Robin Lee are labeled providers, not patient aliases.\" Bad output "
+    "(two different people's names fused into one phrase -- never do this): \"Patient's Jane Doe with AKA Robin "
+    "Lee Janie.\"\n"
+    "8. Output ONLY the rewritten text itself -- the rewritten finding, nothing about the task of rewriting it. "
+    "No preamble, no meta-commentary, no acknowledgment of these instructions, no quotes around it, nothing else. "
+    "If the input text already contains everything needed to rewrite (which it always does), begin your reply "
+    "with the rewrite itself, not a statement that you understood the instructions or are ready to begin."
 )
 
 
@@ -262,7 +284,7 @@ def _restore_page_tags(text: str, tags: list[str]) -> str:
 
 
 def humanize_evidence_with_llm(
-    text: str, *, client: "anthropic.Anthropic | None" = None,
+    text: str, *, client: "anthropic.Anthropic | None" = None, tracker=None,
 ) -> tuple[str, dict]:
     """Runs the free deterministic pass first, then one real Haiku call for
     the tone/length rewrite. Returns (rewritten_text, usage) where usage is
@@ -273,9 +295,16 @@ def humanize_evidence_with_llm(
     `None` (the default, every real caller) constructs a real
     anthropic.Anthropic().
 
+    `tracker` (an ApiCallTracker) is optional but should always be passed
+    in production (humanize_findings_batch, the real caller, does) --
+    checked before the real call below and recorded after, same discipline
+    as every other real call site in this pipeline. Without one, this
+    makes an uncapped real call.
+
     Returns the deterministically-cleaned text UNCHANGED (usage all zeros)
     for empty/None input or input with no non-tag content to rewrite --
-    never spends a real call on nothing.
+    never spends a real call on nothing (and never checks the tracker for
+    a call that was never going to happen anyway).
 
     `usage["pre_humanize_text"]` (Next Round, Part 2) is always the
     deterministically-cleaned text this call started from -- the real
@@ -305,7 +334,45 @@ def humanize_evidence_with_llm(
     if not _PLACEHOLDER_RE.sub("", protected).strip():
         return cleaned, {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "pre_humanize_text": cleaned}
 
-    real_client = client or anthropic.Anthropic()
+    # REAL BUG FOUND AND FIXED (real manual audit round): a not_checkable
+    # rule's own `evidence` is rules.json's own `notes` field verbatim
+    # (see api.py's own not_checkable judgment_results construction) --
+    # for a rule whose notes are just a developer-facing cross-reference
+    # ("Same reasoning as SN-97151-17."), there is genuinely nothing
+    # substantive to rewrite. Confirmed on a real batch: sent as-is, Haiku
+    # correctly recognized it had no real finding to work with and
+    # responded with its own first-person clarification/refusal request
+    # ("I need the original text of SN-97151-17 to rewrite this...") --
+    # which then got stored and shown to a reviewer AS IF it were the
+    # finding. Skipped before ever reaching the model, same as the
+    # empty-input/placeholder-only guards above -- genuinely nothing to
+    # humanize, not a rewrite that then needs rejecting after the fact.
+    if _CROSS_REFERENCE_ONLY_RE.match(cleaned.strip()):
+        return cleaned, {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "pre_humanize_text": cleaned}
+
+    if tracker is not None:
+        tracker.check_before_call()
+    # REAL BUG FOUND AND FIXED (urgent production regression: reviews went
+    # from under a minute to 10+ minutes the moment this pass started
+    # making real calls): the anthropic SDK's own DEFAULT_TIMEOUT is 10
+    # MINUTES per call (confirmed directly in the installed package:
+    # anthropic/_constants.py's DEFAULT_TIMEOUT = httpx2.Timeout(timeout=
+    # 10*60, connect=5.0)), with DEFAULT_MAX_RETRIES=2 on top of that. A
+    # single slow/rate-limited Haiku call among the many this batch now
+    # makes could legitimately hang for up to that full window before
+    # even failing -- and since humanize_findings_batch's per-finding
+    # isolation only catches the exception AFTER it happens, nothing made
+    # that failure happen FAST. One stuck call dominates the whole
+    # batch's wall-clock time even though every other call already
+    # finished. A short, explicit timeout make a stuck/rate-limited call
+    # fail fast instead -- per-finding isolation then falls back to raw
+    # text for THAT finding only, same as any other failure, rather than
+    # the whole document silently waiting minutes on one call. 30s is
+    # comfortably above this pass's own real measured latency for a
+    # short rewrite (a few seconds); max_retries=1 (not the SDK's own
+    # default of 2) keeps one single call from compounding into multiple
+    # multi-second retries on top of that.
+    real_client = client or anthropic.Anthropic(timeout=30.0, max_retries=1)
     # Fix Round (2026-08-27): REAL BUG FOUND AND FIXED -- confirmed on a
     # real completed review, several genuinely long tie-break/merge
     # disagreement summaries (which concatenate 2-3 calls' own evidence
@@ -332,6 +399,16 @@ def humanize_evidence_with_llm(
         "input_tokens": input_tokens, "output_tokens": output_tokens, "cost_usd": cost_usd,
         "pre_humanize_text": cleaned,
     }
+    if tracker is not None:
+        # "anthropic-fallback" -- the SAME provider key model_provider.py's
+        # own CallTracker already prices at claude-haiku-4-5's real rate
+        # ($1.00/$5.00 per Mtok), never Sonnet's -- REWRITE_MODEL IS
+        # claude-haiku-4-5, so this is the correct, not an approximate,
+        # rate for this call.
+        tracker.record(
+            reason="humanize_evidence_with_llm", provider="anthropic-fallback", model=REWRITE_MODEL,
+            usage={"input_tokens": input_tokens, "output_tokens": output_tokens},
+        )
 
     # Hard safety net, not just a hopeful instruction: every PAGEREF token
     # sent in must come back in the response, exactly once each, or this
@@ -396,9 +473,44 @@ def humanize_evidence_with_llm(
     # the rewritten evidence. Reject outright, fall back to the (still
     # real, still cleaned-up) deterministic-only text, same as every
     # other rejection path here -- never surface this to a reviewer.
-    is_leaked_prompt_meta_response = bool(re.search(
-        r"\bI'm ready to rewrite\b|\bI don't see (?:the|any) (?:actual )?(?:evidence|compliance checklist)\b"
-        r"|\bplease provide the (?:compliance checklist|evidence) text\b",
+    # BROADENED (real manual audit round): the pre-call cross-reference
+    # guard above handles the ONE confirmed input shape that provokes
+    # this, but a refusal/clarification response is inherently open-ended
+    # in HOW it's phrased -- a real batch showed at least 9 distinct real
+    # wordings ("I need the original text...", "I can't rewrite this
+    # without...", "Unable to process this request...", "I appreciate the
+    # instruction, but I can't complete...", "I don't have access to the
+    # document...", etc.), all for the identical input. Anchored at the
+    # START of the response (after whitespace) -- a real rewrite of real
+    # evidence describes the PATIENT/session/finding, it does not open by
+    # talking about ITSELF or the rewriting task in the first person.
+    # Anchoring avoids false-positiving on a legitimate finding that
+    # happens to mention e.g. "unable" mid-sentence ("patient was unable
+    # to complete the task").
+    # Rule-agnostic on purpose (Round 5 re-verification): this exact
+    # refusal/meta-acknowledgment shape has now hit TWO unrelated rules in
+    # two rounds (SN-97153-18's cross-reference text, then SN-97153-01's
+    # name-dense finding after the Priority 2 prompt rule was added) --
+    # it's a property of the MODEL's behavior under certain input shapes,
+    # not something tied to one specific rule_id, so detection stays
+    # anchored on the RESPONSE's own opening words regardless of which
+    # rule produced the input. "I understand"/"I'm ready" cover this
+    # round's own real observed openers (all 8 real responses started
+    # with one of these two, even the one that briefly described real
+    # content before pivoting to "Please provide the text to rewrite").
+    is_leaked_prompt_meta_response = bool(re.match(
+        r"\s*(?:"
+        r"I understand\b|I'm ready\b|I am ready\b|"
+        r"I need the (?:actual|original)\b|I don'?t have (?:access|the)\b|I do not have (?:access|the)\b|"
+        r"I can'?t (?:rewrite|complete)\b|I cannot rewrite\b|I'm unable to\b|I am unable to\b|"
+        r"Unable to (?:process|rewrite)\b|I don'?t see (?:the|any)\b|I do not see (?:the|any)\b|"
+        r"I appreciate the instruction\b|Please provide\b|Please share\b|Could you provide\b|"
+        r"I'm ready to rewrite\b|I am ready to rewrite\b"
+        r")",
+        rewritten_protected, re.IGNORECASE,
+    )) or bool(re.search(
+        r"\b(?:send|waiting for) the (?:text|compliance checklist(?:'s)? (?:evidence )?text) to rewrite\b"
+        r"|\bwaiting for the compliance checklist text\b",
         rewritten_protected, re.IGNORECASE,
     ))
     if (
@@ -425,3 +537,118 @@ def humanize_evidence_with_llm(
     else:
         usage["rejection_reason"] = "missing_page_ref"
     return cleaned, usage
+
+
+# Fix Round: this pass used to be a free, deterministic string-truncation
+# heuristic living entirely in the FRONTEND (cut at the last clause
+# boundary before a length budget, promoted to a period). Real bug found
+# via a real manual audit: for the extremely common "X is true, but Y
+# contradicts it" shape every FAIL reason takes, that heuristic cut right
+# at the comma before "but", keeping only the neutral setup fact and
+# silently dropping the entire reason the rule failed. A mechanical
+# string-truncation approach structurally cannot tell "safe to cut" from
+# "the conclusion is right here" -- this round replaces it with the SAME
+# real, already-built LLM rewrite above (humanize_evidence_with_llm),
+# following this project's own reference implementation (the prior
+# TP-review project's app/agent_client.py::humanize_findings): run ONCE
+# per finding, AFTER the full review already has its real, raw reasoning
+# text for every rule -- never inline during rule-checking itself, and
+# never blocking the rest of the review on a single finding's own rewrite.
+#
+# Bounded concurrency, not one worker per finding -- a real review can
+# have 15-40 findings; firing all of them at Anthropic at once isn't
+# necessary and risks real rate limits. 8 concurrent calls, same starting
+# point the reference project settled on.
+_HUMANIZE_MAX_WORKERS = 8
+
+
+def humanize_findings_batch(
+    texts: list[str],
+    *,
+    max_calls: int | None = None,
+    max_spend_usd: float | None = None,
+    labels: list[str] | None = None,
+    client: "anthropic.Anthropic | None" = None,
+) -> list[tuple[str, str, dict]]:
+    """Batch entry point — ONE shared CallTracker across every finding in a
+    single document's review, so a single document's humanize pass can
+    never run away into an unbounded number of real calls (same
+    statelessness convention as review_person_document itself: the caller
+    supplies the cap, this function stays free of backend config). Uses
+    model_provider.CallTracker specifically (NOT call_tracker.
+    ApiCallTracker, which is Sonnet-pricing-specific and would misprice a
+    Haiku call) — it already prices "anthropic-fallback" calls at Haiku's
+    real rate, and is already built thread-safe (a lock around every
+    count/token increment) for exactly this "many concurrent workers share
+    one tracker" shape. Returns one (raw_text, humanized_text, usage)
+    tuple per input text, same order as `texts`.
+
+    Per-finding failure isolation: one finding's own rewrite failing (a
+    bad model response, the page-ref safety net rejecting it, the cap
+    being hit partway through the batch) falls back to (text, text, {}) —
+    that finding's own raw text, unchanged — for THAT finding only. Every
+    other finding in the same batch keeps its own real result, unaffected
+    — a single bad response must never discard an entire batch of
+    already-paid-for real rewrites (the exact real bug the reference
+    project's own humanize_findings was built to fix).
+
+    `labels` (optional, one per text — the caller passes each finding's
+    own rule_id) makes a failure loud and specific when it's logged, not
+    just "something in this batch failed". Falls back to a positional
+    index when not given.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from .model_provider import CallTracker
+
+    tracker = CallTracker(max_calls=max_calls, max_spend_usd=max_spend_usd)
+    results: list[tuple[str, str, dict] | None] = [None] * len(texts)
+
+    def _process_one(i: int, text: str) -> tuple[str, str, dict]:
+        # REAL BUG FOUND AND FIXED (urgent production crash, confirmed via
+        # a real traceback: "ValueError: not enough values to unpack
+        # (expected 3, got 2)" on call #22 of a real batch): humanize_
+        # evidence_with_llm returns a 2-TUPLE (humanized_text, usage) — its
+        # own documented shape. This function's own contract (and every
+        # caller's, including the except branch right below) is a
+        # 3-TUPLE (raw_text, humanized_text, usage). The success path used
+        # to return humanize_evidence_with_llm's result DIRECTLY, with no
+        # reshaping at all — correct on every FAILURE (which separately,
+        # explicitly returns a 3-tuple) but silently wrong on every
+        # SUCCESS, for as long as this function has existed. usage["pre_
+        # humanize_text"] is that 2-tuple's own real "raw" value — see
+        # humanize_evidence_with_llm's own docstring.
+        try:
+            humanized_text, usage = humanize_evidence_with_llm(text, client=client, tracker=tracker)
+            # Real gap found via a real manual audit round: a REJECTED
+            # rewrite (truncated/stray-page-ref/malformed-page-ref/leaked-
+            # meta-response) returns NORMALLY here -- no exception at all,
+            # just humanized_text falling back to the deterministic-only
+            # text with usage["rejection_reason"] set. The except branch
+            # below was the ONLY place this function ever logged anything,
+            # so a rejection (as opposed to an outright API
+            # error/timeout/exception) was invisible -- no way to tell
+            # "this finding genuinely had nothing to rewrite" apart from
+            # "the rewrite was silently rejected for some other reason"
+            # after the fact. Logged here too, distinctly, so the two
+            # cases stay tellable apart in production logs going forward.
+            if usage.get("rejection_reason"):
+                label = labels[i] if labels else f"finding at index {i}"
+                print(
+                    f"[humanize] rewrite REJECTED for {label!r} (reason={usage['rejection_reason']!r}), "
+                    f"falling back to the deterministic-only text for this finding only."
+                )
+            return usage.get("pre_humanize_text", text), humanized_text, usage
+        except Exception as exc:  # noqa: BLE001 — isolate THIS finding only, see docstring above
+            label = labels[i] if labels else f"finding at index {i}"
+            print(f"[humanize] rewrite failed for {label!r}, falling back to raw text for this finding only: {exc}")
+            return (text, text, {})
+
+    if not texts:
+        return []
+    with ThreadPoolExecutor(max_workers=min(_HUMANIZE_MAX_WORKERS, len(texts))) as pool:
+        futures = {pool.submit(_process_one, i, text): i for i, text in enumerate(texts)}
+        for future in futures:
+            i = futures[future]
+            results[i] = future.result()
+    return results  # type: ignore[return-value] -- every slot is filled by the loop above

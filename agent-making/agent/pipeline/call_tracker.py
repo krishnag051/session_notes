@@ -17,6 +17,16 @@ import os
 INPUT_COST_PER_MTOK = 2.00
 OUTPUT_COST_PER_MTOK = 10.00
 
+# claude-haiku-4-5 (model_provider.py's ANTHROPIC_FALLBACK_MODEL) — a
+# DIFFERENT, cheaper rate card from Sonnet above; using the Sonnet
+# constants for a Haiku call would overstate its real cost. FLAG: this is
+# a best-available published-rate estimate, not independently re-verified
+# against Anthropic's live pricing page this round — confirm before
+# treating it as gospel for a real budget decision, same caveat as the
+# Sonnet numbers above.
+HAIKU_INPUT_COST_PER_MTOK = 1.00
+HAIKU_OUTPUT_COST_PER_MTOK = 5.00
+
 # Never silently absent — read once with an explicit default (4.00) rather
 # than "if set" logic that could leave the cap undefined.
 DEFAULT_MAX_SPEND_USD = 4.00

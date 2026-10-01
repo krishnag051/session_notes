@@ -44,9 +44,17 @@ if settings.openrouter_api_key:
 import json
 
 from agent.pipeline import fields as _fields_module  # noqa: E402
+from agent.pipeline.activity_statement import (  # noqa: E402
+    parse_activity_statement_rows as _parse_activity_statement_rows,
+)
 from agent.pipeline.api import classify_batch_pdf as _classify_batch_pdf  # noqa: E402
 from agent.pipeline.api import review_person_document as _review_person_document  # noqa: E402
 from agent.pipeline.extract import extract_pdf_text as _extract_pdf_text  # noqa: E402
+from agent.pipeline.humanize import humanize_findings_batch as _humanize_findings_batch  # noqa: E402
+from agent.pipeline.model_provider import CallTracker as _CallTracker  # noqa: E402
+from agent.pipeline.session_note_extraction import (  # noqa: E402
+    extract_session_note_file as _extract_session_note_file,
+)
 
 _RULES_JSON_PATH = _AGENT_MAKING_PATH / "agent" / "rules" / "rules.json"
 
@@ -84,6 +92,61 @@ def extract_document_summary_fields(pdf_path: str) -> dict:
     }
 
 
+def extract_data_points(pdf_path: str) -> list[dict]:
+    """The [(provider, goal_text, date), ...] 'X added a data point to
+    <goal> for MM/DD/YYYY' bullets fields.py's own goal-counting
+    (SN-97153-03) and history-comparison checks already parse out of the
+    note, zero-cost (regex, no model call) — surfaced here so the
+    frontend's "View Full Extraction" page can show the exact data points
+    those checks actually used, not just their pass/fail verdict."""
+    pages = _extract_pdf_text(pdf_path)
+    fields = {"pages": pages, "full_text": "\n\n".join(p["text"] for p in pages)}
+    return [
+        {"provider": provider, "goal": goal, "date": d.isoformat()}
+        for provider, goal, d in _fields_module.data_point_bullets(fields)
+    ]
+
+
+def extract_session_note_data(
+    pdf_path: str, *, model_override: str | None = None, max_spend_usd: float | None = None,
+) -> dict:
+    """session_note_extraction.py's 6-field structured extraction
+    (session_date/session_location/clinician_telehealth_location/
+    patient_telehealth_location/assessment_activity/note_detail_level) —
+    a REAL, separately-billed model call (OpenRouter by default, an
+    Anthropic fallback only if that's exhausted), distinct from and IN
+    ADDITION TO review_person_document's own call(s) below. `api_cost_usd`
+    is CallTracker's own real, per-provider token-based estimate (Haiku
+    fallback priced at Haiku's own rate, never Sonnet's) — previously a
+    known gap where this call's cost was invisible to the batch spend cap;
+    see app/routers/person_documents.py::run_review, which now folds this
+    into SessionNoteReview.spend_usd. Cached by agent-making itself
+    (content-hash keyed), so re-processing the identical file never
+    repeats the call (and costs nothing on a cache hit).
+
+    `max_spend_usd`: the caller's own REMAINING headroom under the
+    per-document hard cap (settings.per_document_hard_cap_usd) — see
+    run_review's own docstring for why each real call stage gets only
+    its own remaining share, never the full cap, so the three stages
+    combined can never exceed it.
+    """
+    tracker = _CallTracker(max_calls=settings.session_note_extraction_max_calls, max_spend_usd=max_spend_usd)
+    result = _extract_session_note_file(pdf_path, tracker=tracker, model_override=model_override)
+    return {"fields": result, "api_calls_used": tracker.count, "api_cost_usd": tracker.estimated_cost_usd}
+
+
+def extract_activity_statement_rows(pdf_path: str, page_number: int) -> list[dict]:
+    """Zero-cost, regex-only parse of ONE page of the batch's own PDF — the
+    "Activity Statement - <name>" cover page classify_batch_pdf already
+    used as a page-boundary marker (page_number is PersonDocument.
+    activity_statement_page, 1-indexed). No model call, no second upload —
+    this is the same document already sitting in the batch's own
+    original_pdf_path. See agent-making/agent/pipeline/activity_statement.py."""
+    pages = _extract_pdf_text(pdf_path)
+    page_text = pages[page_number - 1]["text"]
+    return _parse_activity_statement_rows(page_text)
+
+
 def load_rules() -> list[dict]:
     """rules.json is the single source of truth for rule metadata
     (type/severity/flag/description) — the backend looks this up at
@@ -99,18 +162,67 @@ def review_person_document(
     *,
     prior_extractions: list[dict] | None = None,
     model_override: str | None = None,
+    timesheet_rows: list[dict] | None = None,
+    appendix: str | None = None,
+    sibling_documents: list[dict] | None = None,
+    max_spend_usd: float | None = None,
 ):
     """Forwards this backend's own configured caps
     (rule_engine_max_calls/rule_engine_max_spend_usd) — a backend process
     calling this on every review should never be able to runaway-retry
     into an unbounded bill, independent of whatever default agent-making's
     own ApiCallTracker would otherwise apply.
+
+    timesheet_rows/appendix: this backend's own responsibility to fetch and
+    slice (agent-making is stateless — see extract_activity_statement_rows
+    above) — the caller passes the batch's own Activity Statement rows plus
+    this PersonDocument's own appendix, so the timesheet-alignment
+    deterministic checks (fields.py::_check_timesheet_alignment et al.) can
+    resolve to a real pass/fail instead of not_checkable.
+
+    sibling_documents: same convention — this person's OTHER documents
+    from the SAME batch/upload (any service code), for any rule phrased
+    as "at least one session note" (see fields.py::_check_SN_97151_11).
+
+    `max_spend_usd`: the caller's own REMAINING headroom under the
+    per-document hard cap (run_review's own docstring) — when given, the
+    STRICTER of this and the flat rule_engine_max_spend_usd setting wins,
+    since the per-document cap must never be loosened by this override,
+    only tightened.
     """
+    effective_max_spend_usd = settings.rule_engine_max_spend_usd
+    if max_spend_usd is not None:
+        effective_max_spend_usd = min(effective_max_spend_usd, max_spend_usd)
     return _review_person_document(
         pdf_path,
         service_code,
         prior_extractions=prior_extractions,
         max_calls=settings.rule_engine_max_calls,
-        max_spend_usd=settings.rule_engine_max_spend_usd,
+        max_spend_usd=effective_max_spend_usd,
         model_override=model_override,
+        timesheet_rows=timesheet_rows,
+        appendix=appendix,
+        sibling_documents=sibling_documents,
+    )
+
+
+def humanize_findings_batch(
+    texts: list[str], *, labels: list[str] | None = None, max_spend_usd: float | None = None,
+) -> list[tuple[str, str, dict]]:
+    """Forwards this backend's own configured cap (humanize_max_calls) —
+    same reasoning as review_person_document's own caps above. Runs AFTER
+    a document's full review already has its real, raw reasoning text for
+    every rule (see app/routers/person_documents.py::run_review, the one
+    real caller) — a separate, real Haiku call per finding, replacing the
+    old client-side string-truncation heuristic that structurally
+    couldn't tell "safe to cut" from "the conclusion is right here" (see
+    agent-making's humanize.py::humanize_findings_batch for the real bug
+    this replaced). Returns one (raw_text, humanized_text, usage) tuple
+    per input text, same order as `texts`.
+
+    `max_spend_usd`: the caller's own REMAINING headroom under the
+    per-document hard cap — see run_review's own docstring.
+    """
+    return _humanize_findings_batch(
+        texts, max_calls=settings.humanize_max_calls, max_spend_usd=max_spend_usd, labels=labels,
     )

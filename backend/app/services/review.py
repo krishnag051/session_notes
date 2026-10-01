@@ -30,6 +30,17 @@ def load_rules_by_id() -> dict[str, dict]:
     return {r["rule_id"]: r for r in load_rules()}
 
 
+def has_applicable_rules(service_code: str) -> bool:
+    """Whether rules.json has ANY active rule for this service_code at
+    all — rules.json's own top-level description explicitly documents
+    that 97156 (family/caregiver guidance) has no transcribed question
+    list at all, unlike 97151/97153/97155. Reviewing a 97156 document
+    through the real pipeline anyway used to burn real spend for zero
+    checking value and produce a misleading 100% ("nothing to fail")
+    score — see run_review's own use of this function."""
+    return any(r["service_code"] == service_code and r["active"] for r in load_rules())
+
+
 def finding_group(rule_result: RuleResult, rules_by_id: dict[str, dict]) -> str:
     if rules_by_id.get(rule_result.rule_id, {}).get("type") == "Informational":
         return "Informational"

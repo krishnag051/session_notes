@@ -1,10 +1,10 @@
 import { createFileRoute, Link, useRouter } from "@tanstack/react-router";
-import { useRef, useState } from "react";
-import { UploadCloud, FileText, CheckCircle2, XCircle } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { UploadCloud, FileText, CheckCircle2, XCircle, Loader2 } from "lucide-react";
 import { PageHeader } from "@/components/AppSidebar";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { uploadBatch } from "@/lib/api";
+import { getBatch, uploadBatch, type BatchReviewSummary } from "@/lib/api";
 
 export const Route = createFileRoute("/upload")({
   head: () => ({
@@ -28,16 +28,44 @@ function UploadPage() {
   const [peopleCount, setPeopleCount] = useState(0);
   const [errorMessage, setErrorMessage] = useState("");
   const [dragging, setDragging] = useState(false);
+  const [batchId, setBatchId] = useState<string | null>(null);
+  const [reviewSummary, setReviewSummary] = useState<BatchReviewSummary | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Classification finishes (and this page moves to "done") well before
+  // each document's own real review has actually run — those are kicked
+  // off in the background the moment the batch is created (see
+  // POST /batches) and finish one at a time. Poll so Krishna sees them
+  // complete progressively, matching the real product behavior, instead
+  // of a single all-or-nothing "done".
+  useEffect(() => {
+    if (phase !== "done" || !batchId) return;
+    let cancelled = false;
+    const poll = async () => {
+      const batch = await getBatch(batchId);
+      if (cancelled) return;
+      setReviewSummary(batch.review_summary);
+      if (batch.review_summary.pending + batch.review_summary.processing > 0) {
+        timer = setTimeout(poll, 3000);
+      }
+    };
+    let timer = setTimeout(poll, 500);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [phase, batchId]);
 
   async function start(file: File) {
     setFileName(file.name);
     setPhase("processing");
     try {
-      const batch = (await uploadBatch(file)) as { documents: { person_id: string | null }[] };
+      const batch = await uploadBatch(file);
       const distinctPeople = new Set(batch.documents.map((d) => d.person_id).filter(Boolean));
       setPeopleCount(distinctPeople.size);
       setFinishedAt(new Date().toLocaleString());
+      setBatchId(batch.id);
+      setReviewSummary(batch.review_summary);
       setPhase("done");
       router.invalidate();
     } catch (err) {
@@ -103,6 +131,30 @@ function UploadPage() {
               <p className="mt-1 text-sm text-muted-foreground">
                 {fileName} · {finishedAt}
               </p>
+
+              {reviewSummary && (
+                <div className="mt-4 flex flex-col items-center gap-1 text-sm text-muted-foreground">
+                  {reviewSummary.pending + reviewSummary.processing > 0 ? (
+                    <div className="flex items-center gap-2">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Running compliance review — {reviewSummary.complete + reviewSummary.no_applicable_rules} of{" "}
+                      {reviewSummary.pending + reviewSummary.processing + reviewSummary.complete + reviewSummary.failed + reviewSummary.skipped_spend_cap + reviewSummary.no_applicable_rules}{" "}
+                      documents done so far…
+                    </div>
+                  ) : (
+                    <div>
+                      Compliance review finished — {reviewSummary.complete} complete
+                      {reviewSummary.no_applicable_rules > 0 && `, ${reviewSummary.no_applicable_rules} had no applicable rules`}
+                      {reviewSummary.failed > 0 && `, ${reviewSummary.failed} failed`}
+                      {reviewSummary.skipped_spend_cap > 0 && `, ${reviewSummary.skipped_spend_cap} skipped (spend cap reached)`}
+                    </div>
+                  )}
+                  <div className="text-xs">
+                    ${reviewSummary.total_spend_usd.toFixed(2)} spent · {reviewSummary.total_api_calls} model calls so far
+                  </div>
+                </div>
+              )}
+
               <div className="mt-6 flex gap-3">
                 <Button asChild>
                   <Link to="/audits">View results in Audits</Link>

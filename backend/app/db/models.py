@@ -19,6 +19,7 @@ SQLite (this backend's own test suite, which has no real Postgres server
 to run against in this environment) without dialect-specific column types.
 """
 import uuid
+from datetime import datetime
 
 from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, JSON, String, Text, func
 from sqlalchemy.orm import relationship
@@ -49,12 +50,24 @@ class SessionNoteBatch(Base):
 
     id = Column(String(36), primary_key=True, default=_uuid)
     uploaded_by = Column(String(255), nullable=True)
-    uploaded_at = Column(DateTime, nullable=False, server_default=func.now())
+    uploaded_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
     original_pdf_path = Column(String(1024), nullable=False)
+    # The real filename the user uploaded (UploadFile.filename) — kept
+    # separately from original_pdf_path, which is a random uuid-named file
+    # on disk (never the real name). For the Upload History tab: null only
+    # for a pre-this-phase batch that predates this column.
+    original_filename = Column(String(512), nullable=True)
     # Raw BatchClassificationResult JSON from classify_batch_pdf, kept
     # verbatim for audit — includes admin_noise_pages/unresolved, never
     # hidden from the API response.
     classification_result = Column(JSON, nullable=False)
+    # True only when THIS upload request explicitly passed
+    # skip_auto_review=true (see routers/batches.py::create_batch's own
+    # docstring) — added after a real, unplanned spend incident during
+    # manual verification against a live-keyed backend. False (the
+    # default) means the normal per-document real review was scheduled
+    # the moment this batch was created.
+    auto_review_skipped = Column(Boolean, nullable=False, default=False)
 
     documents = relationship("PersonDocument", back_populates="batch")
 
@@ -84,6 +97,15 @@ class PersonDocument(Base):
     # unresolved — null for a 'confident' row.
     classification_note = Column(Text, nullable=True)
     active = Column(Boolean, nullable=False, default=True)  # no hard deletes
+    # The physical page (in the ORIGINAL batch PDF) of this person's own
+    # "Activity Statement - <name>" cover page — classify_batch.py already
+    # finds this (it's the same page-boundary marker that splits the batch
+    # into per-person ranges), but it was never persisted until this real
+    # second data source was actually wired up for timesheet-alignment
+    # rule-checking. Null only for an 'unresolved' row (no person, so no
+    # cover page was ever attributed) or a pre-this-phase batch that
+    # predates this column.
+    activity_statement_page = Column(Integer, nullable=True)
 
     batch = relationship("SessionNoteBatch", back_populates="documents")
     person = relationship("Person", back_populates="documents")
@@ -123,15 +145,35 @@ class SessionNoteReview(Base):
     reviewed_at = Column(DateTime, nullable=True)
     # passed / (passed + failed) among scored findings — see
     # services/review.py::compute_score. Stored, not recomputed on every
-    # list-page render.
+    # list-page render. Null until status="complete".
     score = Column(Float, nullable=True)
     # A threshold on `score` (settings.audit_pass_threshold) — see
     # services/review.py::compute_audit_result. Never hand-set directly by
-    # any endpoint.
-    audit_result = Column(String(16), nullable=False, default="needs_review")
+    # any endpoint. Null until status="complete" — "not yet known" must
+    # never be confused with a real pass/fail verdict.
+    audit_result = Column(String(16), nullable=True)
+    # pending (row created, not yet started) -> processing (background job
+    # picked it up) -> complete / failed / skipped_spend_cap (the batch's
+    # cumulative spend cap was already hit before this document's turn —
+    # see app/services/batch_reviews.py). A distinct axis from
+    # reviewed/audit_result, same "never collapse independent fields"
+    # discipline as everywhere else in this schema.
+    status = Column(String(24), nullable=False, default="pending")
+    error_message = Column(Text, nullable=True)  # set only when status="failed"
     api_calls_used = Column(Integer, nullable=False, default=0)
     spend_usd = Column(Float, nullable=False, default=0.0)
-    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    # BUG FIX: server_default=func.now() alone truncates to whole-SECOND
+    # resolution on SQLite (this suite's own test dialect) — a manual
+    # re-run creating a second review for the same document within the
+    # same second as its original auto-created "pending" row ties exactly,
+    # making "the latest review" (GET .../review, _review_summary) pick an
+    # arbitrary row rather than the real latest one. Found via the new
+    # retry-mechanism tests. default=datetime.utcnow (client-side, real
+    # microsecond precision, independent of column/dialect truncation)
+    # fixes the ordering; server_default kept as a fallback for a
+    # hypothetical direct-SQL insert (none exist in this app — see
+    # CLAUDE.md's own "always through the app's own endpoint" discipline).
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
 
     person_document = relationship("PersonDocument", back_populates="reviews")
     rule_results = relationship("RuleResult", back_populates="review")
@@ -148,6 +190,15 @@ class RuleResult(Base):
     # Written ONCE, by the review endpoint, from agent-making's own
     # finding — never touched again by anyone, for any reason.
     model_status = Column(String(32), nullable=True)
+    # The real, pre-humanization reasoning text — written once, alongside
+    # model_finding (which now holds the POST-humanize text), never
+    # touched again. Kept as its own permanent column (not recomputed on
+    # demand) so the CSV export's "raw vs humanized" columns stay
+    # genuinely independent audit trail, same as the reference TP-review
+    # project's own model_finding_raw. Null for a pre-this-phase row
+    # (predates the real humanize pass) or a check whose evidence was
+    # empty/not_checkable (nothing to humanize).
+    model_finding_raw = Column(Text, nullable=True)
     model_finding = Column(Text, nullable=True)
     model_evidence = Column(JSON, nullable=True)  # str, or the {page, detail} list form
     model_page = Column(JSON, nullable=True)  # int, list[int], or None

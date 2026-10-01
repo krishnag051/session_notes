@@ -11,9 +11,15 @@ export const Route = createFileRoute("/rules")({
   head: () => ({
     meta: [
       { title: "Rules — Session Note Compliance" },
-      { name: "description", content: "The compliance questions applied to 97151, 97153 and 97156 notes." },
+      {
+        name: "description",
+        content: "The compliance questions applied to 97151, 97153 and 97156 notes.",
+      },
       { property: "og:title", content: "Rules — Session Note Compliance" },
-      { property: "og:description", content: "The compliance questions applied to 97151, 97153 and 97156 notes." },
+      {
+        property: "og:description",
+        content: "The compliance questions applied to 97151, 97153 and 97156 notes.",
+      },
     ],
   }),
   component: RulesPage,
@@ -22,20 +28,25 @@ export const Route = createFileRoute("/rules")({
 function RulesPage() {
   const rules = Route.useLoaderData();
   const [q, setQ] = useState("");
-  const rows = useMemo(
-    () => rules.filter((r) => r.question.toLowerCase().includes(q.toLowerCase())),
-    [rules, q],
-  );
+  const rows = useMemo(() => {
+    const needle = q.toLowerCase();
+    return rules.filter(
+      (r) => r.question.toLowerCase().includes(needle) || r.rule_id.toLowerCase().includes(needle),
+    );
+  }, [rules, q]);
 
   return (
     <div>
-      <PageHeader title="Rules" subtitle="Compliance questions evaluated against every uploaded note." />
+      <PageHeader
+        title="Rules"
+        subtitle="Compliance questions evaluated against every uploaded note."
+      />
 
       <Card className="shadow-card">
         <CardContent className="p-0">
           <div className="border-b p-4">
             <Input
-              placeholder="Search question text…"
+              placeholder="Search rule ID or question text…"
               value={q}
               onChange={(e) => setQ(e.target.value)}
               className="max-w-md"
@@ -45,6 +56,7 @@ function RulesPage() {
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b text-left text-xs uppercase tracking-wide text-muted-foreground">
+                  <th className="px-5 py-3 font-medium">Rule ID</th>
                   <th className="px-5 py-3 font-medium">Question</th>
                   <th className="px-5 py-3 font-medium">Applies to</th>
                   <th className="px-5 py-3 font-medium">Type</th>
@@ -54,6 +66,9 @@ function RulesPage() {
               <tbody>
                 {rows.map((r) => (
                   <tr key={r.rule_id} className="border-b last:border-0 hover:bg-muted/50">
+                    <td className="whitespace-nowrap px-5 py-3 font-mono text-xs text-muted-foreground">
+                      {r.rule_id}
+                    </td>
                     <td className="max-w-xl px-5 py-3 font-medium">{r.question}</td>
                     <td className="px-5 py-3">
                       <div className="flex flex-wrap gap-1">

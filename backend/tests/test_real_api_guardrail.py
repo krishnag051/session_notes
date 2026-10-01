@@ -44,6 +44,42 @@ def test_guardrail_active_by_default_with_no_special_setup():
     assert person_documents_module.review_person_document.__name__ == "_blocked_review_person_document"
 
 
+def test_humanize_seam_blocks_by_default_once_a_test_mocks_review_person_document(client, monkeypatch):
+    """The post-review humanize pass is a THIRD real call site run_review
+    reaches unconditionally after ANY successful review_person_document
+    result — proves it's genuinely guarded too, not just assumed covered
+    because dozens of other tests happen to also mock it away."""
+    class _FakeUsage:
+        api_calls = 0
+        estimated_cost_usd = 0.0
+
+    class _FakeResult:
+        status = "complete"
+        findings = {"SN-97153-16": {"check_type": "deterministic", "result": "pass", "evidence": "ok", "page": 6, "confidence": 1.0}}
+        usage = _FakeUsage()
+        error = None
+
+    # Deliberately mocks review_person_document (opting into "mocked
+    # pipeline run") but NOT humanize_findings_batch — the real
+    # app.agent_client.humanize_findings_batch would still be reached for
+    # the one real finding above unless the guardrail's own
+    # _maybe_fake_humanize_findings_batch catches it.
+    monkeypatch.setattr(person_documents_module, "review_person_document", lambda *a, **k: _FakeResult())
+    monkeypatch.setattr(
+        person_documents_module, "extract_session_note_data",
+        lambda *a, **k: {"fields": {}, "api_calls_used": 0, "api_cost_usd": 0.0},
+    )
+
+    batch = _upload_batch(client, "batch_19page_3client.pdf")
+    doc = next(d for d in batch["documents"] if d["service_code"] is not None)
+    resp = client.post(f"/api/person-documents/{doc['id']}/review", json={})
+    # The fake humanize fallback returns (text, text, {}) for every
+    # finding -- a real network attempt would have 500'd instead.
+    assert resp.status_code == 201, resp.text
+    review = resp.json()
+    assert review["grouped_results"]["Passed"][0]["final_finding"] == "ok"
+
+
 def test_guardrail_raises_the_expected_exception_type_and_message():
     """Same request as the black-box 500 test above, but with server
     exceptions propagated to this test process directly — the precise
@@ -81,6 +117,27 @@ def test_real_api_marker_opts_out_of_the_autouse_guard(client, monkeypatch):
         error = None
 
     monkeypatch.setattr(person_documents_module, "review_person_document", lambda *a, **k: _FakeResult())
+    # This phase added a SECOND real call site (session_note_extraction.py,
+    # via app.agent_client.extract_session_note_data) — with the guard
+    # fixture standing down for @pytest.mark.real_api, that seam is left
+    # as agent-making's REAL, unpatched function unless mocked here too;
+    # without this line this test would silently attempt a real OpenRouter
+    # call, contradicting its own docstring's "WITHOUT ... touching the
+    # real network" claim.
+    monkeypatch.setattr(
+        person_documents_module, "extract_session_note_data",
+        lambda *a, **k: {"fields": {}, "api_calls_used": 0, "api_cost_usd": 0.0},
+    )
+    # A THIRD real call site (the post-review humanize pass, via
+    # app.agent_client.humanize_findings_batch) — same reasoning as
+    # extract_session_note_data above. findings={} above means this
+    # particular test would call it with an empty list (itself a zero-cost
+    # no-op), but mocked explicitly anyway so this test stays correct even
+    # if that stops being true.
+    monkeypatch.setattr(
+        person_documents_module, "humanize_findings_batch",
+        lambda texts, **k: [(t, t, {}) for t in texts],
+    )
 
     batch = _upload_batch(client, "batch_19page_3client.pdf")
     doc = next(d for d in batch["documents"] if d["service_code"] is not None)

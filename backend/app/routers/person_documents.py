@@ -1,17 +1,32 @@
+import logging
 import os
+import time
+import traceback
 from datetime import date as date_type, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.agent_client import extract_document_summary_fields, extract_pdf_full_text, review_person_document
+from app.agent_client import (
+    extract_activity_statement_rows,
+    extract_data_points,
+    extract_document_summary_fields,
+    extract_pdf_full_text,
+    extract_session_note_data,
+    humanize_findings_batch,
+    review_person_document,
+)
 from app.audit import record as audit_record
+from app.config import settings
 from app.db.base import get_db
 from app.db.models import Person, PersonDocument, RuleResult, SessionNoteBatch, SessionNoteReview
 from app.services.pdf_slicing import slice_pdf_to_temp_file
-from app.services.review import compute_score_and_audit_result, finding_group, load_rules_by_id
+from app.services.review import compute_score_and_audit_result, finding_group, has_applicable_rules, load_rules_by_id
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["person_documents"])
 
@@ -26,12 +41,16 @@ class RuleResultOut(BaseModel):
 
     id: str
     rule_id: str
+    question: str | None  # rules.json's own description — the findings panel's bold header text
     check_type: str
     group: str
     final_status: str
     final_finding: str | None
     final_pages: object | None
     model_status: str | None
+    # The real, pre-humanization reasoning text — see RuleResult.model_finding_raw's
+    # own docstring. Surfaced for the CSV export's "raw vs humanized" columns.
+    model_finding_raw: str | None
     is_overridden: bool
 
 
@@ -44,11 +63,14 @@ class ReviewOut(BaseModel):
     service_code: str | None
     date_of_service: date_type | None
     appendix: str | None
+    has_activity_statement: bool
     reviewed: bool
     reviewed_by: str | None
     reviewed_at: datetime | None
+    status: str
+    error_message: str | None
     score: float | None
-    audit_result: str
+    audit_result: str | None
     provider_name: str | None
     bcba_name: str | None
     session_start_time: str | None
@@ -60,10 +82,13 @@ class ReviewOut(BaseModel):
 
 def _rule_result_out(rr: RuleResult, rules_by_id: dict) -> RuleResultOut:
     return RuleResultOut(
-        id=rr.id, rule_id=rr.rule_id, check_type=rr.check_type,
+        id=rr.id, rule_id=rr.rule_id,
+        question=rules_by_id.get(rr.rule_id, {}).get("description"),
+        check_type=rr.check_type,
         group=finding_group(rr, rules_by_id),
         final_status=rr.final_status, final_finding=rr.final_finding, final_pages=rr.final_pages,
-        model_status=rr.model_status, is_overridden=rr.overridden_by is not None,
+        model_status=rr.model_status, model_finding_raw=rr.model_finding_raw,
+        is_overridden=rr.overridden_by is not None,
     )
 
 
@@ -81,8 +106,10 @@ def _review_out(review: SessionNoteReview, person_document: PersonDocument, pers
         person_id=person_document.person_id, client_name=person.full_name if person else None,
         service_code=person_document.service_code, date_of_service=person_document.date_of_service,
         appendix=person_document.appendix,
+        has_activity_statement=person_document.activity_statement_page is not None,
         reviewed=review.reviewed,
         reviewed_by=review.reviewed_by, reviewed_at=review.reviewed_at,
+        status=review.status, error_message=review.error_message,
         score=review.score, audit_result=review.audit_result,
         provider_name=review.provider_name, bcba_name=review.bcba_name,
         session_start_time=review.session_start_time, session_end_time=review.session_end_time,
@@ -114,6 +141,18 @@ def _load_prior_extractions(db: Session, person_document: PersonDocument) -> lis
             PersonDocument.person_id == person_document.person_id,
             PersonDocument.service_code == person_document.service_code,
             PersonDocument.id != person_document.id,
+            # REAL BUG FOUND AND FIXED: without this, an ARCHIVED duplicate
+            # of THIS SAME real visit (the same source PDF re-uploaded in a
+            # separate batch — confirmed via a real Joseph Bergstein 97153
+            # CSV audit: two PersonDocument rows, same person+service_code+
+            # date_of_service, one `active=False`) still counted as a
+            # genuine "prior session" — comparing this document against an
+            # archived copy of ITSELF, not a real separate visit, and
+            # producing a false "100% similarity to a previous session".
+            # `active=False` is CLAUDE.md's own explicit "this doesn't
+            # represent current, real data" flag — history comparison must
+            # never pull from it.
+            PersonDocument.active.is_(True),
             SessionNoteReview.full_text.is_not(None),
         )
         # BUG FIX: must order by the document's own date_of_service, never
@@ -131,16 +170,400 @@ def _load_prior_extractions(db: Session, person_document: PersonDocument) -> lis
     ]
 
 
+def _load_sibling_documents(db: Session, batch: SessionNoteBatch, person_document: PersonDocument) -> list[dict] | None:
+    """This SAME person's OTHER documents from the SAME batch/upload (any
+    service code), as plain data — for any rule phrased as "at least one
+    session note" rather than scoped to a specific assessment/service type
+    (see agent-making's fields.py::_check_SN_97151_11). Real bug found via
+    a real Daniel Cazi 97151/97156 CSV audit: a sibling 97156 (Parent
+    Training) document in the same upload already covered this rule's own
+    question, but the pipeline only ever looked at the single document
+    being reviewed. Extracted fresh (zero-cost, no model call) from each
+    sibling's own page range — NOT read from a previously-stored review's
+    full_text, since batch review processes one document at a time and a
+    later sibling may not have been reviewed yet when an earlier one is.
+
+    CRITICAL BUG FOUND AND FIXED (real, confirmed cross-patient data leak):
+    a batch upload is NOT one person per batch — a single real upload
+    (confirmed directly: one real 14-document, multi-patient batch_id)
+    can and does contain MANY different patients' documents together. This
+    query originally filtered ONLY by batch_id, with no person_id filter
+    at all — so a person with NO real sibling of their own (confirmed:
+    Aiza Nabiha, read page-by-page, has none) was being handed ANOTHER
+    REAL PATIENT'S document (Daniel Cazi's own real 97156 document,
+    sitting in the same batch_id) as if it were her own "sibling",
+    producing PASS with Cazi's own real content/reasoning attached to her
+    review. `PersonDocument.person_id == person_document.person_id` is the
+    fix — sibling lookups must be scoped to the same PATIENT, not just the
+    same batch row.
+    """
+    siblings = db.execute(
+        select(PersonDocument).where(
+            PersonDocument.batch_id == batch.id,
+            PersonDocument.person_id == person_document.person_id,
+            PersonDocument.id != person_document.id,
+            PersonDocument.active.is_(True),
+            PersonDocument.service_code.is_not(None),
+        )
+    ).scalars().all()
+    if not siblings:
+        return None
+    result = []
+    for sibling in siblings:
+        sib_path = slice_pdf_to_temp_file(batch.original_pdf_path, sibling.page_start, sibling.page_end)
+        try:
+            result.append({"service_code": sibling.service_code, "full_text": extract_pdf_full_text(sib_path)})
+        finally:
+            os.unlink(sib_path)
+    return result
+
+
+def run_review(
+    db: Session,
+    review: SessionNoteReview,
+    person_document: PersonDocument,
+    batch: SessionNoteBatch,
+    *,
+    actor: str | None = None,
+    model_override: str | None = None,
+    raise_on_error: bool = True,
+) -> SessionNoteReview:
+    """Runs the real pipeline for an EXISTING (already flushed) review row —
+    the one place both the manual re-run endpoint below and the automatic
+    per-batch background job (app/services/batch_reviews.py) actually call
+    into agent-making. Mutates `review` in place (status -> processing,
+    then complete/failed) and commits — caller is responsible for the
+    row's initial creation/flush and for the batch-level spend-cap check
+    (this function always runs once it's called).
+
+    `raise_on_error`: the batch background job (no HTTP response to return,
+    other documents in the same batch still need to run) always passes
+    False — one document's failure must never crash the whole batch, so it
+    marks status="failed" with the real error message and moves on. The
+    manual re-run endpoint keeps the ORIGINAL pre-this-phase behavior
+    (True): an unexpected exception still surfaces as a real 500, not a
+    silently-swallowed "failed" row — this is also what
+    tests/test_real_api_guardrail.py's own proof relies on (an unmocked
+    call must be LOUD, never quietly absorbed).
+
+    HARD PER-DOCUMENT SPEND CAP (urgent production ask, settings.
+    per_document_hard_cap_usd, default $2.00): enforced by giving EACH of
+    the three real call stages below (extraction, review_person_document,
+    humanize) only its own REMAINING headroom under the cap as ITS OWN
+    max_spend_usd — never the full cap, and never looser than this
+    function's own existing per-stage settings (rule_engine_max_spend_usd
+    etc.), only ever tighter. Once accumulated_cost_usd already meets or
+    exceeds the cap, the next stage is skipped outright (remaining
+    headroom computed as exactly $0, which every stage's own tracker
+    already refuses to spend anything against) rather than attempted and
+    left to fail on its own. This makes it structurally impossible for
+    the three stages combined to exceed the cap, regardless of which one
+    would otherwise have been the big spender.
+    """
+    review.status = "processing"
+    db.commit()
+
+    prior_extractions = _load_prior_extractions(db, person_document)
+    sibling_documents = _load_sibling_documents(db, batch, person_document)
+    sliced_path = slice_pdf_to_temp_file(batch.original_pdf_path, person_document.page_start, person_document.page_end)
+
+    try:
+        full_text = extract_pdf_full_text(sliced_path)
+        summary_fields = extract_document_summary_fields(sliced_path)
+        review.full_text = full_text
+        review.provider_name = summary_fields["provider_name"]
+        review.bcba_name = summary_fields["bcba_name"]
+        review.session_start_time = summary_fields["session_start_time"]
+        review.session_end_time = summary_fields["session_end_time"]
+
+        # BUG FIX: a document whose service_code has NO rules.json entries
+        # at all (97156 today — see has_applicable_rules's own docstring)
+        # used to still run the full real pipeline anyway, burning real
+        # spend for zero checking value and landing on a misleading 100%
+        # ("nothing to fail") score. Checked here, BEFORE either real call
+        # below, using only the free full_text/summary_fields work above —
+        # never even queues the billed calls for a service_code with
+        # nothing to check.
+        if not has_applicable_rules(person_document.service_code):
+            review.status = "no_applicable_rules"
+            db.commit()
+            os.unlink(sliced_path)
+            return review
+
+        db.commit()
+    except Exception:  # noqa: BLE001 — this zero-cost setup phase has no real spend to lose; not worth retrying
+        review.status = "failed"
+        review.error_message = traceback.format_exc()
+        logger.error(
+            "review setup failed for person_document_id=%s: %s", person_document.id, review.error_message,
+        )
+        db.commit()
+        os.unlink(sliced_path)
+        if raise_on_error:
+            raise
+        return review
+
+    # A transient failure (a flaky real-API response, a momentary network
+    # blip) shouldn't require a human to notice and manually re-trigger
+    # this document — bounded automatic retries for an UNEXPECTED
+    # exception only (never for review_person_document's own structured
+    # status="error" reporting below, e.g. a spend cap — retrying that
+    # wouldn't help and would just burn more real calls for the same
+    # outcome). accumulated_cost_usd/accumulated_calls span every attempt,
+    # not just the last one, so a failed-then-retried-successfully attempt
+    # still accounts for whatever an earlier attempt's extraction call
+    # really cost. No exception ever escapes this loop — it always either
+    # breaks on success or falls through having recorded last_traceback,
+    # and the raise-on-exhaustion (if any) happens cleanly AFTER the loop,
+    # never from inside it, so it can't be caught by its own except clause.
+    max_attempts = 1 + settings.review_retry_attempts
+    accumulated_cost_usd = 0.0
+    accumulated_calls = 0
+    extraction: dict | None = None
+    result = None
+    last_traceback: str | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            remaining_budget = max(0.0, settings.per_document_hard_cap_usd - accumulated_cost_usd)
+            extraction = extract_session_note_data(
+                sliced_path, model_override=model_override, max_spend_usd=remaining_budget,
+            )
+            accumulated_cost_usd += extraction["api_cost_usd"]
+            accumulated_calls += extraction["api_calls_used"]
+            data_points = extract_data_points(sliced_path)
+            review.extraction = {"fields": extraction["fields"], "data_points": data_points}
+
+            # The Activity Statement is the SAME batch PDF's own cover
+            # page (already sitting in original_pdf_path — no second
+            # upload), parsed zero-cost. None only when this batch
+            # genuinely has no cover page recorded for this person (see
+            # PersonDocument.activity_statement_page's own docstring) —
+            # timesheet-alignment checks correctly stay not_checkable
+            # in that case, never silently guessed at.
+            timesheet_rows = (
+                extract_activity_statement_rows(batch.original_pdf_path, person_document.activity_statement_page)
+                if person_document.activity_statement_page is not None
+                else None
+            )
+
+            remaining_budget = max(0.0, settings.per_document_hard_cap_usd - accumulated_cost_usd)
+            result = review_person_document(
+                sliced_path, person_document.service_code,
+                prior_extractions=prior_extractions, model_override=model_override,
+                timesheet_rows=timesheet_rows, appendix=person_document.appendix,
+                sibling_documents=sibling_documents, max_spend_usd=remaining_budget,
+            )
+            # REAL BUG FOUND AND FIXED: review_person_document's own
+            # blanket exception handler (agent-making/agent/pipeline/
+            # api.py) never lets a raw exception escape — it catches
+            # EVERYTHING and returns status="error" instead (this is where
+            # the original PydanticUserError crash actually landed, NOT as
+            # a raised Python exception reaching this function at all, so
+            # the retry loop below never used to retry it). error_type
+            # distinguishes a deliberate, non-retryable limit
+            # ("cap_exceeded") from a genuinely unexpected one-off crash
+            # ("unexpected") — only the latter retries here; a spend/call
+            # cap being hit again on retry would just waste another real
+            # call for the identical outcome.
+            if result.status == "error" and result.error_type == "unexpected":
+                last_traceback = result.error
+                accumulated_cost_usd += result.usage.estimated_cost_usd
+                accumulated_calls += result.usage.api_calls
+                logger.error(
+                    "review attempt %d/%d failed for person_document_id=%s (unexpected error from "
+                    "review_person_document itself): %s",
+                    attempt, max_attempts, person_document.id, last_traceback,
+                )
+                result = None
+                if attempt < max_attempts:
+                    time.sleep(settings.review_retry_backoff_seconds)
+                    continue
+                break
+            break  # success, or a deliberate non-retryable error — stop retrying
+        except Exception:  # noqa: BLE001 — an honest "failed" status, never a bare 500 mid-batch
+            # The FULL traceback, not just str(exc) — the previous,
+            # message-only form made a real production crash
+            # (PydanticUserError: "BaseModel cannot be instantiated
+            # directly") undiagnosable after the fact, with no file/line
+            # pointing at the actual call site. Logged immediately too, so
+            # it's visible even if this review's own row is never inspected.
+            last_traceback = traceback.format_exc()
+            result = None
+            logger.error(
+                "review attempt %d/%d failed for person_document_id=%s: %s",
+                attempt, max_attempts, person_document.id, last_traceback,
+            )
+            if attempt < max_attempts:
+                time.sleep(settings.review_retry_backoff_seconds)
+
+    if result is None:
+        # Every attempt either raised or came back as an unexpected error,
+        # and retries are exhausted — a clear, permanent failed state,
+        # never a silent loop or hang.
+        review.status = "failed"
+        review.error_message = last_traceback
+        review.spend_usd = accumulated_cost_usd
+        review.api_calls_used = accumulated_calls
+        db.commit()
+        os.unlink(sliced_path)
+        if raise_on_error:
+            raise RuntimeError(last_traceback)
+        return review
+
+    if result.status == "error":
+        # Only a deliberate, non-retryable error (error_type="cap_exceeded")
+        # can reach here — an "unexpected" one either succeeded on a later
+        # attempt or was already handled by the result-is-None branch above.
+        review.status = "failed"
+        review.error_message = result.error
+        # accumulated_cost_usd/accumulated_calls already include every
+        # attempt's own extraction cost (including any earlier attempt
+        # that raised before reaching review_person_document at all) —
+        # this must still count toward the batch spend cap, same as the
+        # success path below.
+        review.api_calls_used = accumulated_calls + result.usage.api_calls
+        review.spend_usd = accumulated_cost_usd + result.usage.estimated_cost_usd
+        db.commit()
+        os.unlink(sliced_path)
+        return review
+
+    os.unlink(sliced_path)
+
+    # REAL BUG FOUND AND FIXED (urgent production crash — a real traceback:
+    # "ValueError: not enough values to unpack (expected 3, got 2)" at the
+    # zip-unpack below): everything from here through the final commit
+    # used to run with NO try/except at all. Inside a FastAPI BackgroundTasks
+    # callback (the automatic per-batch path, run_batch_reviews ->
+    # run_review), an uncaught exception here has nowhere to surface — it
+    # silently dies in the background thread, and the review is left
+    # stuck at status="processing" forever, with no error visible from the
+    # UI or any query. That's indistinguishable from a genuine hang, which
+    # is exactly how this looked before the real traceback was found.
+    # Wrapped the same way the earlier retry-loop stages already are:
+    # mark "failed" with the FULL traceback, roll back any partial
+    # rule_results this attempt may have already `db.add()`-ed (never a
+    # half-written set — same all-or-nothing discipline the reference
+    # project's own upload_pipeline.py documents for this exact shape of
+    # work), and still re-raise for the manual endpoint's raise_on_error
+    # contract.
+    humanize_cost_usd = 0.0
+    humanize_calls = 0
+    try:
+        # The post-review humanization pass — runs ONCE, after every rule
+        # has already been evaluated and has its own real, raw reasoning
+        # text, as a real Haiku call per finding (batched/parallel — see
+        # agent-making's humanize.py::humanize_findings_batch). Replaces
+        # the old client-side string-truncation heuristic (frontend/src/
+        # lib/findings.ts), which structurally couldn't tell "safe to cut"
+        # from "the conclusion is right here" — real bug found via a real
+        # manual audit: it cut right at the comma before "but" in "X is
+        # true, but Y contradicts it" (the shape nearly every FAIL reason
+        # takes), silently dropping the entire reason a rule failed.
+        # model_finding_raw keeps the real pre-humanize text as a separate,
+        # permanent column (for the CSV export's own "raw vs humanized"
+        # columns) — model_finding/final_finding now hold the humanized
+        # text, same "write once" discipline as before.
+        rule_ids = list(result.findings.keys())
+        raw_texts = [_finding_text(result.findings[rid].get("evidence")) for rid in rule_ids]
+        # Remaining headroom under the per-document hard cap AFTER
+        # extraction + review_person_document's own real spend above — the
+        # humanize pass gets only whatever's left, never the full cap (see
+        # this function's own docstring on the hard spend cap).
+        humanize_remaining_budget = max(
+            0.0,
+            settings.per_document_hard_cap_usd - accumulated_cost_usd - result.usage.estimated_cost_usd,
+        )
+        humanize_results = humanize_findings_batch(
+            [t or "" for t in raw_texts], labels=rule_ids, max_spend_usd=humanize_remaining_budget,
+        )
+        humanized_by_rule_id: dict[str, tuple[str | None, str | None]] = {}
+        for rid, raw_text, (_, humanized_text, usage) in zip(rule_ids, raw_texts, humanize_results):
+            humanized_by_rule_id[rid] = (raw_text, humanized_text if raw_text is not None else None)
+            if usage.get("input_tokens") or usage.get("output_tokens"):
+                humanize_calls += 1
+                humanize_cost_usd += usage.get("cost_usd", 0.0)
+
+        rule_results: list[RuleResult] = []
+        for rule_id, finding in result.findings.items():
+            raw_text, humanized_text = humanized_by_rule_id[rule_id]
+            rr = RuleResult(
+                review_id=review.id,
+                rule_id=rule_id,
+                check_type=finding.get("check_type"),
+                model_status=finding.get("result"),
+                model_finding=humanized_text,
+                model_finding_raw=raw_text,
+                model_evidence=finding.get("evidence"),
+                model_page=finding.get("page"),
+                model_confidence=finding.get("confidence"),
+                final_status=finding.get("result"),
+                final_finding=humanized_text,
+                final_pages=finding.get("page"),
+            )
+            db.add(rr)
+            rule_results.append(rr)
+        db.flush()
+
+        review.score, review.audit_result = compute_score_and_audit_result(rule_results)
+        # accumulated_calls/accumulated_cost_usd already include every
+        # attempt's own extraction cost, including a retried-after-failure
+        # attempt — same reasoning as the status="error" branch above.
+        # Third real call site this document's review now makes: the
+        # post-review humanize pass above (one Haiku call per finding) —
+        # folded in here the same way session_note_extraction's own cost
+        # was, so the batch spend cap actually sees every real dollar a
+        # review spends, not just two of its three real call sites.
+        review.api_calls_used = accumulated_calls + result.usage.api_calls + humanize_calls
+        # All three real calls this document's review makes, each priced
+        # at its own real rate (session_note_extraction's own CallTracker
+        # now estimates cost per-provider — see agent_client.py/
+        # model_provider.CallTracker — closing what was previously a
+        # batch-spend-cap blind spot).
+        review.spend_usd = accumulated_cost_usd + result.usage.estimated_cost_usd + humanize_cost_usd
+        review.status = "complete"
+
+        audit_record(
+            db, entity_type="session_note_review", entity_id=review.id,
+            changes={
+                "status": ("processing", "complete"),
+                "audit_result": (None, review.audit_result),
+                "score": (None, review.score),
+                "person_document_id": (None, person_document.id),
+            },
+            actor=actor,
+        )
+        db.commit()
+        db.refresh(review)
+        return review
+    except Exception:  # noqa: BLE001 — see this block's own comment above; never a silent background-task death
+        db.rollback()  # undo any partial rule_results this attempt already db.add()-ed — never a half-written set
+        review.status = "failed"
+        review.error_message = traceback.format_exc()
+        review.api_calls_used = accumulated_calls + result.usage.api_calls + humanize_calls
+        review.spend_usd = accumulated_cost_usd + result.usage.estimated_cost_usd + humanize_cost_usd
+        logger.error(
+            "post-review processing (humanize pass / rule_results) failed for person_document_id=%s: %s",
+            person_document.id, review.error_message,
+        )
+        db.commit()
+        if raise_on_error:
+            raise
+        return review
+
+
 @router.post(
     "/person-documents/{person_document_id}/review",
     response_model=ReviewOut,
     status_code=status.HTTP_201_CREATED,
 )
 def review_document(person_document_id: str, body: ReviewRequestIn, db: Session = Depends(get_db)) -> ReviewOut:
-    """Loads this Person's prior SessionNoteReview.full_text rows (same
-    service code, earlier documents) as prior_extractions, calls
-    review_person_document, and writes the SessionNoteReview + RuleResult
-    rows in one transaction with the audit-log helper.
+    """Manual (re-)run — creates a FRESH review row and runs it
+    synchronously. Distinct from the automatic per-batch background job:
+    every confident PersonDocument already gets a pending review row (and
+    a queued background run) the moment its batch finishes classifying —
+    see POST /batches — so this endpoint exists for an explicit re-review
+    (e.g. after correcting a misclassification), not the normal path.
     """
     person_document = db.get(PersonDocument, person_document_id)
     if person_document is None:
@@ -153,70 +576,22 @@ def review_document(person_document_id: str, body: ReviewRequestIn, db: Session 
         )
 
     batch = db.get(SessionNoteBatch, person_document.batch_id)
-    prior_extractions = _load_prior_extractions(db, person_document)
 
-    sliced_path = slice_pdf_to_temp_file(batch.original_pdf_path, person_document.page_start, person_document.page_end)
-    try:
-        full_text = extract_pdf_full_text(sliced_path)
-        summary_fields = extract_document_summary_fields(sliced_path)
-        result = review_person_document(
-            sliced_path, person_document.service_code,
-            prior_extractions=prior_extractions, model_override=body.model_override,
-        )
-    finally:
-        os.unlink(sliced_path)
-
-    if result.status == "error":
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"review_person_document failed: {result.error}")
-
-    review = SessionNoteReview(
-        person_document_id=person_document.id,
-        full_text=full_text,
-        provider_name=summary_fields["provider_name"],
-        bcba_name=summary_fields["bcba_name"],
-        session_start_time=summary_fields["session_start_time"],
-        session_end_time=summary_fields["session_end_time"],
-        audit_result="needs_review",
-        api_calls_used=result.usage.api_calls,
-        spend_usd=result.usage.estimated_cost_usd,
-    )
+    review = SessionNoteReview(person_document_id=person_document.id, status="pending")
     db.add(review)
     db.flush()
 
-    rule_results: list[RuleResult] = []
-    for rule_id, finding in result.findings.items():
-        finding_text = _finding_text(finding.get("evidence"))
-        rr = RuleResult(
-            review_id=review.id,
-            rule_id=rule_id,
-            check_type=finding.get("check_type"),
-            model_status=finding.get("result"),
-            model_finding=finding_text,
-            model_evidence=finding.get("evidence"),
-            model_page=finding.get("page"),
-            model_confidence=finding.get("confidence"),
-            final_status=finding.get("result"),
-            final_finding=finding_text,
-            final_pages=finding.get("page"),
-        )
-        db.add(rr)
-        rule_results.append(rr)
-    db.flush()
+    review = run_review(db, review, person_document, batch, actor=body.actor, model_override=body.model_override)
 
-    review.score, review.audit_result = compute_score_and_audit_result(rule_results)
+    if review.status == "failed":
+        # An exception-raising failure already propagated as a bare 500
+        # before reaching here (raise_on_error=True, the default for this
+        # manual path) — this covers the OTHER kind of failure,
+        # review_person_document returning an expected result.status ==
+        # "error" rather than raising, same 502 contract this endpoint has
+        # always had.
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"review failed: {review.error_message}")
 
-    audit_record(
-        db, entity_type="session_note_review", entity_id=review.id,
-        changes={
-            "audit_result": (None, review.audit_result),
-            "score": (None, review.score),
-            "person_document_id": (None, person_document.id),
-        },
-        actor=body.actor,
-    )
-
-    db.commit()
-    db.refresh(review)
     person = db.get(Person, person_document.person_id) if person_document.person_id else None
     return _review_out(review, person_document, person)
 
@@ -230,6 +605,17 @@ class PersonDocumentOut(BaseModel):
     date_of_service: date_type | None
     appendix: str | None
     classification_confidence: str
+    active: bool
+
+
+def _person_document_out(person_document: PersonDocument, person: Person | None) -> PersonDocumentOut:
+    return PersonDocumentOut(
+        id=person_document.id, batch_id=person_document.batch_id, person_id=person_document.person_id,
+        client_name=person.full_name if person else None,
+        service_code=person_document.service_code, date_of_service=person_document.date_of_service,
+        appendix=person_document.appendix, classification_confidence=person_document.classification_confidence,
+        active=person_document.active,
+    )
 
 
 @router.get("/person-documents/{person_document_id}", response_model=PersonDocumentOut)
@@ -241,11 +627,182 @@ def get_person_document(person_document_id: str, db: Session = Depends(get_db)) 
     if person_document is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="person_document not found")
     person = db.get(Person, person_document.person_id) if person_document.person_id else None
-    return PersonDocumentOut(
-        id=person_document.id, batch_id=person_document.batch_id, person_id=person_document.person_id,
-        client_name=person.full_name if person else None,
-        service_code=person_document.service_code, date_of_service=person_document.date_of_service,
-        appendix=person_document.appendix, classification_confidence=person_document.classification_confidence,
+    return _person_document_out(person_document, person)
+
+
+class ArchiveActionIn(BaseModel):
+    actor: str
+
+
+@router.patch("/person-documents/{person_document_id}/archive", response_model=PersonDocumentOut)
+def archive_person_document(person_document_id: str, body: ArchiveActionIn, db: Session = Depends(get_db)) -> PersonDocumentOut:
+    """Soft — sets active=false, hides it from the default Audits list,
+    reversible via /unarchive. The recommended way to clean up a known-bad
+    test audit; never removes the underlying rows (see CLAUDE.md's own
+    no-hard-deletes invariant) — DELETE below is the deliberate, narrow
+    exception to that, not this."""
+    person_document = db.get(PersonDocument, person_document_id)
+    if person_document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="person_document not found")
+    if not person_document.active:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="already archived")
+
+    person_document.active = False
+    audit_record(
+        db, entity_type="person_document", entity_id=person_document.id,
+        changes={"active": (True, False)}, actor=body.actor,
+    )
+    db.commit()
+    db.refresh(person_document)
+    person = db.get(Person, person_document.person_id) if person_document.person_id else None
+    return _person_document_out(person_document, person)
+
+
+@router.patch("/person-documents/{person_document_id}/unarchive", response_model=PersonDocumentOut)
+def unarchive_person_document(person_document_id: str, body: ArchiveActionIn, db: Session = Depends(get_db)) -> PersonDocumentOut:
+    person_document = db.get(PersonDocument, person_document_id)
+    if person_document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="person_document not found")
+    if person_document.active:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="not archived")
+
+    person_document.active = True
+    audit_record(
+        db, entity_type="person_document", entity_id=person_document.id,
+        changes={"active": (False, True)}, actor=body.actor,
+    )
+    db.commit()
+    db.refresh(person_document)
+    person = db.get(Person, person_document.person_id) if person_document.person_id else None
+    return _person_document_out(person_document, person)
+
+
+class DeleteForeverIn(BaseModel):
+    actor: str
+    reason: str
+
+
+@router.post("/person-documents/{person_document_id}/delete-forever", status_code=status.HTTP_204_NO_CONTENT)
+def delete_person_document_forever(person_document_id: str, body: DeleteForeverIn, db: Session = Depends(get_db)) -> None:
+    """A DELIBERATE, EXPLICIT exception to this project's usual no-hard-
+    deletes convention (CLAUDE.md) — Krishna specifically asked for a way
+    to permanently remove known-bad early test audits (pre-goal-counting-
+    fix extractions), not a general pattern to reuse elsewhere without
+    being asked again. Real, permanent, cascading: every SessionNoteReview
+    for this document and every RuleResult under those reviews is deleted
+    along with the PersonDocument itself.
+
+    The audit_log entry documenting WHO deleted WHAT and WHY is written
+    and committed FIRST, in its own transaction, specifically so it
+    survives even though the row it describes will not — the one place in
+    this codebase an audit trail entry is deliberately NOT in the same
+    transaction as the change it describes, because "in the same
+    transaction as a hard delete" would mean it could vanish too.
+    """
+    person_document = db.get(PersonDocument, person_document_id)
+    if person_document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="person_document not found")
+
+    review_ids = list(db.execute(
+        select(SessionNoteReview.id).where(SessionNoteReview.person_document_id == person_document_id)
+    ).scalars())  # .scalars() already yields the plain id strings — no .id attribute access needed
+
+    audit_record(
+        db, entity_type="person_document", entity_id=person_document.id,
+        changes={
+            "deleted_forever": (False, True),
+            "reason": (None, body.reason),
+            "review_ids_deleted": (None, review_ids),
+        },
+        actor=body.actor,
+    )
+    db.commit()  # the audit entry survives independent of what happens below
+
+    for review_id in review_ids:
+        db.execute(RuleResult.__table__.delete().where(RuleResult.review_id == review_id))
+    db.execute(SessionNoteReview.__table__.delete().where(SessionNoteReview.person_document_id == person_document_id))
+    db.delete(person_document)
+    db.commit()
+
+
+@router.get("/person-documents/{person_document_id}/pdf")
+def get_person_document_pdf(person_document_id: str, db: Session = Depends(get_db)) -> FileResponse:
+    """This document's own page range only (page_start–page_end), sliced
+    out of the batch's original PDF — never the whole batch file — for the
+    audit detail page's left-hand document viewer.
+
+    BUG FIX: Starlette's FileResponse defaults content_disposition_type to
+    "attachment" the moment a `filename` is passed — that alone was
+    forcing a download prompt in the browser regardless of anything the
+    frontend did with the response. `content_disposition_type="inline"`
+    is the actual fix; the frontend's PDF viewer (react-pdf) fetches this
+    as raw bytes anyway, but a correct inline disposition is still what
+    makes this URL behave sanely if ever opened directly.
+    """
+    person_document = db.get(PersonDocument, person_document_id)
+    if person_document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="person_document not found")
+    batch = db.get(SessionNoteBatch, person_document.batch_id)
+    sliced_path = slice_pdf_to_temp_file(batch.original_pdf_path, person_document.page_start, person_document.page_end)
+    return FileResponse(
+        sliced_path, media_type="application/pdf", filename=f"{person_document_id}.pdf",
+        content_disposition_type="inline",
+    )
+
+
+@router.get("/person-documents/{person_document_id}/activity-statement-pdf")
+def get_activity_statement_pdf(person_document_id: str, db: Session = Depends(get_db)) -> FileResponse:
+    """This person's own single "Activity Statement - <name>" cover page —
+    the real timesheet document the SN-*-04/SN-*-09 checks now resolve
+    against (see PersonDocument.activity_statement_page's own docstring) —
+    sliced out of the SAME batch PDF, so a non-technical reviewer can
+    independently confirm a flagged mismatch against the real source.
+    404 when this batch predates the column, or this row is 'unresolved'
+    (no person, so no cover page was ever attributed) — never guessed at.
+    """
+    person_document = db.get(PersonDocument, person_document_id)
+    if person_document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="person_document not found")
+    if person_document.activity_statement_page is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no activity statement recorded for this document")
+    batch = db.get(SessionNoteBatch, person_document.batch_id)
+    page = person_document.activity_statement_page
+    sliced_path = slice_pdf_to_temp_file(batch.original_pdf_path, page, page)
+    return FileResponse(
+        sliced_path, media_type="application/pdf", filename=f"{person_document_id}-activity-statement.pdf",
+        content_disposition_type="inline",
+    )
+
+
+class ExtractionOut(BaseModel):
+    status: str
+    full_text: str | None
+    fields: dict | None  # session_note_extraction.py's 6-field structured output
+    data_points: list[dict] | None  # [{provider, goal, date}, ...] the goal-counting/history checks used
+
+
+@router.get("/person-documents/{person_document_id}/extraction", response_model=ExtractionOut)
+def get_extraction(person_document_id: str, db: Session = Depends(get_db)) -> ExtractionOut:
+    """The full, unfiltered "View Full Extraction" page's own data source —
+    every data point actually pulled from the document and used in
+    matching/checking, not just the summary fields on the main detail
+    page. Reads the LATEST review for this document, whatever its status."""
+    person_document = db.get(PersonDocument, person_document_id)
+    if person_document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="person_document not found")
+    review = db.execute(
+        select(SessionNoteReview)
+        .where(SessionNoteReview.person_document_id == person_document_id)
+        .order_by(SessionNoteReview.created_at.desc())
+    ).scalars().first()
+    if review is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no review yet for this person_document")
+    extraction = review.extraction or {}
+    return ExtractionOut(
+        status=review.status,
+        full_text=review.full_text,
+        fields=extraction.get("fields"),
+        data_points=extraction.get("data_points"),
     )
 
 

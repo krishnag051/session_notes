@@ -82,7 +82,34 @@ def test_review_person_document_needs_history_with_similar_prior_extraction(monk
     assert result.status == "complete"
 
 
+def test_review_person_document_sets_error_type_cap_exceeded_for_a_spend_cap(monkeypatch):
+    """Distinguishes a deliberate, non-retryable limit from a genuinely
+    unexpected crash -- the backend's own retry mechanism reads error_type
+    to decide whether retrying is ever worthwhile at all. Simulates the
+    tracker's own cap check firing (rather than needing to reconstruct a
+    real multi-call scenario that trips it) -- isolates whether
+    review_person_document's except clause maps this exception type
+    correctly, which is the thing actually under test here."""
+    from ..pipeline.call_tracker import ApiSpendCapExceeded
+
+    def _raises_spend_cap(*a, **k):
+        raise ApiSpendCapExceeded("would exceed the $4.00 cap")
+
+    monkeypatch.setattr(judge_module, "_run_judgment_checks_once", _raises_spend_cap)
+
+    result = api_module.review_person_document(
+        str(FIXTURES / "single_doc_97153_bergstein.pdf"), "97153", prior_extractions=None,
+    )
+    assert result.status == "error"
+    assert result.error_type == "cap_exceeded"
+
+
 def test_review_person_document_returns_structured_error_for_missing_file():
     result = api_module.review_person_document("/no/such/file.pdf", "97153", prior_extractions=None)
     assert result.status == "error"
     assert result.error is not None
+    # error_type distinguishes a deliberate, non-retryable limit
+    # ("cap_exceeded") from a genuinely unexpected one-off crash
+    # ("unexpected") -- a missing file is the latter, and the backend's own
+    # retry mechanism reads this field to decide whether to retry at all.
+    assert result.error_type == "unexpected"

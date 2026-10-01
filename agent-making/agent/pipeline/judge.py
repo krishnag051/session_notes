@@ -366,7 +366,14 @@ def _run_judgment_checks_once(
     if tracker is not None:
         tracker.check_before_call(estimated_max_tokens=MAX_TOKENS)
 
-    client = anthropic.Anthropic()
+    # Explicit, bounded timeout -- see humanize.py's own real-bug comment
+    # (same SDK, same 10-minute DEFAULT_TIMEOUT otherwise) for the full
+    # story: a single slow/rate-limited call hanging up to 10 minutes was
+    # confirmed as the real cause of a production review-time regression.
+    # 120s here (vs. humanize's 30s) because this is a genuinely heavier
+    # call -- a full judgment batch over multiple rules and page images,
+    # not a short per-finding rewrite -- still far short of the default.
+    client = anthropic.Anthropic(timeout=120.0, max_retries=1)
 
     # thinking disabled: this is a bounded classification/extraction task, not
     # open-ended reasoning, and Sonnet 5 runs adaptive thinking by default —
@@ -500,7 +507,41 @@ def _page_for_uncertain_fallback(entries: list[dict]):
     return None
 
 
+def _fail_strictly_beats_uncertain(entries: list[dict]) -> dict | None:
+    """Real bug found via a real Cazi 97151/SN-97151-09 CSV audit: two
+    judges independently found the SAME underlying facts (this rule's own
+    required-vs-actual component count) and both effectively concluded a
+    real shortfall -- one just hedged and called it "uncertain" instead of
+    committing to "fail". The old reconciliation treated that exactly like
+    a genuine pass-vs-fail disagreement and defaulted to "uncertain",
+    discarding a real, evidence-grounded majority.
+
+    An "uncertain" vote is a judge declining to commit, not a vote FOR
+    passing -- it carries no evidence that this should pass. So when the
+    only results present are "fail" and "uncertain" (NO "pass" vote
+    anywhere) and "fail" is the STRICT plurality among them, the honest
+    answer is "fail", not a blanket "uncertain". Scoped narrowly on
+    purpose: any real "pass" vote, or an exact fail/uncertain tie, still
+    falls through to the ordinary uncertain fallback below -- a genuine
+    pass-vs-fail split (a real question about which way this goes) is
+    untouched.
+    """
+    counts = Counter(e["result"] for e in entries)
+    fail_votes, uncertain_votes, pass_votes = counts.get("fail", 0), counts.get("uncertain", 0), counts.get("pass", 0)
+    if pass_votes == 0 and fail_votes > 0 and fail_votes > uncertain_votes:
+        fail_entries = [e for e in entries if e["result"] == "fail"]
+        return (
+            next((e for e in fail_entries if e.get("page") is not None), None)
+            or next((e for e in fail_entries if not e.get("page_unresolved")), None)
+            or fail_entries[0]
+        )
+    return None
+
+
 def _two_way_uncertain_finding(f: dict, s: dict) -> dict:
+    fail_winner = _fail_strictly_beats_uncertain([f, s])
+    if fail_winner is not None:
+        return {**fail_winner, "evidence": _coerce_evidence_for_finding(fail_winner["evidence"])}
     fallback_page = _page_for_uncertain_fallback([f, s])
     return {
         "result": "uncertain",
@@ -667,6 +708,10 @@ def _reconcile_majority_vote(
                 or winning_entries[0]
             )
             reconciled[rule_id] = {**winner, "evidence": _coerce_evidence_for_finding(winner["evidence"])}
+            continue
+        fail_winner = _fail_strictly_beats_uncertain(entries)
+        if fail_winner is not None:
+            reconciled[rule_id] = {**fail_winner, "evidence": _coerce_evidence_for_finding(fail_winner["evidence"])}
             continue
         bar_desc = f"needed {int(required)}+ agreeing" if min_agreement is not None else "no majority"
         fallback_page = _page_for_uncertain_fallback(entries)

@@ -46,6 +46,8 @@ from typing import Any
 import requests
 from dotenv import load_dotenv
 
+from . import call_tracker
+
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
 DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
@@ -476,7 +478,11 @@ def _call_anthropic(
     """
     import anthropic
 
-    client = anthropic.Anthropic()
+    # Explicit, bounded timeout -- see humanize.py's own real-bug comment
+    # (same SDK, same 10-minute DEFAULT_TIMEOUT otherwise) for the full
+    # story behind why every real client construction in this pipeline
+    # now sets one explicitly.
+    client = anthropic.Anthropic(timeout=60.0, max_retries=1)
     response = client.messages.create(
         model=model,
         max_tokens=max_tokens,
@@ -554,7 +560,10 @@ def call_tool_json_with_images(
             },
         })
 
-    client = anthropic.Anthropic()
+    # Explicit, bounded timeout -- see humanize.py's own real-bug comment
+    # for the full story; 90s (vs. 60s for the text-only call above) to
+    # give a real vision call a bit more headroom.
+    client = anthropic.Anthropic(timeout=90.0, max_retries=1)
     response = client.messages.create(
         model=model,
         max_tokens=max_tokens,
@@ -571,6 +580,19 @@ def call_tool_json_with_images(
     return tool_use_block.input
 
 
+# Per-provider pricing lookup for CallTracker.estimated_cost_usd below --
+# "openrouter" is genuinely $0 by construction (see this module's own
+# docstring); "anthropic" and "anthropic-fallback" route to DIFFERENT real
+# models (Sonnet vs Haiku -- see DEFAULT_ANTHROPIC_MODEL/
+# ANTHROPIC_FALLBACK_MODEL above) with different real rate cards, so they
+# each get their own entry rather than one shared Anthropic rate.
+_PRICING_BY_PROVIDER = {
+    "openrouter": (0.0, 0.0),
+    "anthropic": (call_tracker.INPUT_COST_PER_MTOK, call_tracker.OUTPUT_COST_PER_MTOK),
+    "anthropic-fallback": (call_tracker.HAIKU_INPUT_COST_PER_MTOK, call_tracker.HAIKU_OUTPUT_COST_PER_MTOK),
+}
+
+
 class CallTracker:
     """Round 59's OpenRouter-and-Anthropic-agnostic call tracker -- separate
     from call_tracker.py's ApiCallTracker (which is Anthropic-pricing-
@@ -579,12 +601,37 @@ class CallTracker:
     of provider, and cost only when the provider actually charges anything
     (OpenRouter's free-tier calls are always $0 by construction -- pricing
     is looked up per-provider, not assumed).
+
+    Fix (this phase): `estimated_cost_usd` was previously undocumented-
+    but-missing -- callers (e.g. session_note_extraction.py's own real
+    call site) had call-count visibility but NO cost estimate at all, a
+    real blind spot in any batch-level spend cap built on top of this
+    tracker. Tokens are now tracked PER PROVIDER (not just in aggregate),
+    since "anthropic" (Sonnet) and "anthropic-fallback" (Haiku) have
+    different real per-token rates and a single aggregate total-tokens
+    number can't be priced correctly across both.
     """
 
-    def __init__(self, max_calls: int | None = None):
+    def __init__(self, max_calls: int | None = None, max_spend_usd: float | None = None):
         self.max_calls = max_calls
+        # Hard, enforced ceiling (urgent production ask: "no single
+        # document's review may spend more than $2 in real API cost...
+        # this needs to be an actual enforced limit, not just a
+        # monitoring/alert"). Checked BEFORE every call, same as
+        # max_calls above -- stops the NEXT call once already-spent cost
+        # is at or over this ceiling, rather than letting a call through
+        # that would push spend further over. A simple "already spent >=
+        # cap" check (not ApiCallTracker's more elaborate "project the
+        # NEXT call's likely cost" one) -- good enough to guarantee this
+        # tracker never lets spend run away, at the cost of allowing
+        # (at most) one more call's worth of overshoot past the cap
+        # before stopping, which the caller's own per-document ceiling
+        # budgets for by construction (each stage gets only its own
+        # REMAINING headroom as its max_spend_usd, never the full cap).
+        self.max_spend_usd = max_spend_usd
         self.count = 0
         self.calls_by_provider: dict[str, int] = {}
+        self.tokens_by_provider: dict[str, dict[str, int]] = {}
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         # Fix Round (Performance, 2026-09-11): both real call sites this
@@ -608,16 +655,40 @@ class CallTracker:
                 raise ModelCallError(
                     f"Refusing call #{self.count + 1}: cap is {self.max_calls}. Stopped before making the call, not after."
                 )
+            if self.max_spend_usd is not None and self.estimated_cost_usd >= self.max_spend_usd:
+                raise ModelCallError(
+                    f"Refusing call #{self.count + 1}: already spent ${self.estimated_cost_usd:.4f}, "
+                    f"at or over the ${self.max_spend_usd:.2f} cap. Stopped before making the call, not after."
+                )
 
     def record(self, *, reason: str, provider: str, model: str, usage: dict) -> None:
         with self._lock:
             self.count += 1
             self.calls_by_provider[provider] = self.calls_by_provider.get(provider, 0) + 1
-            self.total_input_tokens += usage.get("input_tokens", 0)
-            self.total_output_tokens += usage.get("output_tokens", 0)
+            input_tokens = usage.get("input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            self.total_input_tokens += input_tokens
+            self.total_output_tokens += output_tokens
+            provider_tokens = self.tokens_by_provider.setdefault(provider, {"input": 0, "output": 0})
+            provider_tokens["input"] += input_tokens
+            provider_tokens["output"] += output_tokens
             print(
                 f"[model-provider] call #{self.count} ({provider}:{model}, reason={reason!r}) -- "
                 f"tokens in={usage.get('input_tokens', 0)} out={usage.get('output_tokens', 0)}. "
                 f"Running total: {self.count}{f'/{self.max_calls}' if self.max_calls else ''} "
-                f"({self.calls_by_provider})"
+                f"({self.calls_by_provider}), est. cost so far: ${self.estimated_cost_usd:.4f}"
             )
+
+    @property
+    def estimated_cost_usd(self) -> float:
+        """Real dollar estimate, summed per-provider so a Haiku fallback
+        call and a Sonnet primary call are each priced at their own real
+        rate rather than one shared assumption. Unknown providers price at
+        $0 rather than raising -- this tracker's job is visibility, not to
+        become a second place call-site changes have to keep in sync."""
+        total = 0.0
+        for provider, tokens in self.tokens_by_provider.items():
+            input_rate, output_rate = _PRICING_BY_PROVIDER.get(provider, (0.0, 0.0))
+            total += tokens["input"] / 1_000_000 * input_rate
+            total += tokens["output"] / 1_000_000 * output_rate
+        return total
