@@ -51,9 +51,26 @@ NOT_CHECKABLE_AFTER_RETRIES_TEMPLATE = (
     "Marked Not checkable rather than guessing."
 )
 
-PAGE_UNAVAILABLE_NOTE = (
-    " (A specific page could not be confirmed for this finding -- the result itself is still accurate.)"
-)
+# Fix Round (2026-10-05), "humanizer writing quality" -- REAL ROOT CAUSE
+# FOUND: Krishna compared our output against a reference compliance tool
+# side-by-side and found our writing reads as hedged/padded, calling out
+# specifically "...though a specific page couldn't be confirmed, but the
+# result is accurate"-shaped sentences as a recurring pattern. That exact
+# wording traces here, not to humanize.py's own prompt (the original guess)
+# -- this note used to be appended, unconditionally, to EVERY finding still
+# missing a page after retries, PASS included. humanize_evidence_with_llm's
+# own system prompt then has no way to tell "a real fact" from "a reflexive
+# disclaimer about our own process" -- its rule 1 (never drop a real fact)
+# faithfully preserves this note in every rewrite, which is exactly why it
+# kept surviving humanization unchanged. Per judge.py's own stated design
+# ("PAGE NUMBERS MATTER MOST ON NON-PASS RESULTS"), a PASS finding missing
+# a page is normal and unremarkable -- there is nothing here worth telling
+# a reader. Scoped below to non-pass results only (see the loop that uses
+# this), where a missing page is a real, worth-disclosing gap. Reworded
+# too: states the fact plainly, drops the apologetic "the result itself is
+# still accurate" tail -- that clause reads like the system apologizing
+# for its own limitation rather than reporting a finding.
+PAGE_UNAVAILABLE_NOTE = " No specific page could be confirmed for this finding."
 
 
 class IntegrityError(Exception):
@@ -257,9 +274,12 @@ def _run_page_recovery_pass(
         )
     for rule_id in unresolved_ids:
         finding = results[rule_id]
-        note = PAGE_UNAVAILABLE_NOTE.format(attempts=attempts_made + 1)  # +1: the initial attempt too
-        if isinstance(finding["evidence"], str):
-            finding["evidence"] = finding["evidence"] + note
+        # Pass findings skip the note entirely (see PAGE_UNAVAILABLE_NOTE's
+        # own comment) -- a missing page on a pass is unremarkable and
+        # calling it out every time is exactly the reflexive hedging
+        # Krishna flagged by real side-by-side comparison.
+        if finding.get("result") != "pass" and isinstance(finding["evidence"], str):
+            finding["evidence"] = finding["evidence"] + PAGE_UNAVAILABLE_NOTE
         finding.pop("page_unresolved", None)
 
     # Clear the internal bookkeeping flag from every OTHER finding too --

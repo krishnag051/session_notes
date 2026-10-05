@@ -95,6 +95,16 @@ def _block_real_api_calls(request, monkeypatch):
     from agent.pipeline import model_provider as model_provider_module
 
     if request.node.get_closest_marker("real_api") is not None:
+        # Fix Round (2026-10-05), "structural gate for the debug-script
+        # incident": every real call site now ALSO checks
+        # real_api_guard.ensure_real_api_calls_allowed() before it does
+        # anything, regardless of whether this pytest-level guardrail
+        # exists at all — this is what actually protects a bare script run
+        # outside pytest, which has none of this file's fixtures applied.
+        # A real_api-marked test is the one place that code-level gate
+        # must stand down too, same per-instance approval this marker
+        # already requires — set only for this test's own duration.
+        monkeypatch.setenv("ALLOW_REAL_API_CALLS", "1")
         monkeypatch.setattr(
             model_provider_module, "_call_openrouter",
             _make_ceiling_enforced(model_provider_module._call_openrouter, label="model_provider._call_openrouter"),

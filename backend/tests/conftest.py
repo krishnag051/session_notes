@@ -158,6 +158,15 @@ def _block_real_api_calls(request, monkeypatch):
     itself permission — see the module docstring above.
     """
     if request.node.get_closest_marker("real_api") is not None:
+        # Fix Round (2026-10-05), "structural gate for the debug-script
+        # incident": agent-making's own real call sites now ALSO require
+        # ALLOW_REAL_API_CALLS=1 before doing anything — the code-level
+        # gate that actually protects a bare script run outside pytest
+        # (which has none of this fixture applied at all). A real_api
+        # test reaching all the way into agent-making's real functions
+        # needs that gate to stand down too, for this test's own duration
+        # only — same per-instance approval the marker already requires.
+        monkeypatch.setenv("ALLOW_REAL_API_CALLS", "1")
         yield
         return
     import app.routers.person_documents as person_documents_module
@@ -165,6 +174,40 @@ def _block_real_api_calls(request, monkeypatch):
     monkeypatch.setattr(person_documents_module, "review_person_document", _blocked_review_person_document)
     monkeypatch.setattr(person_documents_module, "extract_session_note_data", _maybe_fake_extract_session_note_data)
     monkeypatch.setattr(person_documents_module, "humanize_findings_batch", _maybe_fake_humanize_findings_batch)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _clear_review_cache_between_tests():
+    """REAL BUG FOUND AND FIXED (2026-10-05): the review-result cache
+    (app/services/review_cache.py) is keyed on DOCUMENT CONTENT, not a row
+    id — which is exactly the point in production (a genuinely identical
+    document reuses a prior real result), but this suite's test database
+    is session-scoped (one shared sqlite file for every test in the run,
+    per this file's own module docstring), and dozens of tests upload the
+    SAME real fixture PDF (e.g. batch_19page_3client.pdf) and mock a
+    SUCCESSFUL review for it. Without this fixture, an EARLIER test's own
+    mocked result silently satisfies a LATER, unrelated test's cache
+    lookup for the identical document content — that later test's own
+    `review_person_document`/`extract_session_note_data` mock is then
+    never even called (confirmed real failure: test_endpoints.py::
+    test_reviewing_a_document_never_counts_it_as_its_own_history started
+    failing with an empty `captured` list the moment caching was wired in,
+    traced to exactly this — test_review_document_mocked_writes_review_
+    and_rule_results, earlier in the same file, already cached the
+    identical document). Clearing this table before every test keeps each
+    test's own content-cache world isolated, the same way each test
+    already gets fresh Person/PersonDocument rows — this is a test-suite
+    hygiene fix for a now-shared table, not a change to the real caching
+    behavior itself (see test_review_cache.py for that).
+    """
+    from app.db.models import ReviewCache
+
+    Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    session = Session()
+    session.query(ReviewCache).delete()
+    session.commit()
+    session.close()
     yield
 
 

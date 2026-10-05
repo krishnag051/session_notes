@@ -21,7 +21,7 @@ to run against in this environment) without dialect-specific column types.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, JSON, String, Text, func
+from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import relationship
 
 from .base import Base
@@ -153,15 +153,29 @@ class SessionNoteReview(Base):
     # never be confused with a real pass/fail verdict.
     audit_result = Column(String(16), nullable=True)
     # pending (row created, not yet started) -> processing (background job
-    # picked it up) -> complete / failed / skipped_spend_cap (the batch's
+    # picked it up) -> complete / failed / skipped_spend_cap (the BATCH's
     # cumulative spend cap was already hit before this document's turn —
-    # see app/services/batch_reviews.py). A distinct axis from
-    # reviewed/audit_result, same "never collapse independent fields"
-    # discipline as everywhere else in this schema.
+    # see app/services/batch_reviews.py) / cancelled_spend_cap (THIS one
+    # set's own per_document_hard_cap_usd ceiling was hit mid-review —
+    # Fix Round 2026-10-05, "per-classified-set spend cap": a distinct,
+    # deliberate safety-stop, never conflated with status="failed", which
+    # means a genuinely unexpected crash/bug. error_message carries the
+    # real reason either way. A distinct axis from reviewed/audit_result,
+    # same "never collapse independent fields" discipline as everywhere
+    # else in this schema.
     status = Column(String(24), nullable=False, default="pending")
-    error_message = Column(Text, nullable=True)  # set only when status="failed"
+    error_message = Column(Text, nullable=True)  # set when status="failed" or "cancelled_spend_cap"
     api_calls_used = Column(Integer, nullable=False, default=0)
     spend_usd = Column(Float, nullable=False, default=0.0)
+    # Fix Round (2026-10-05), "non-determinism fix": true when this
+    # review's own rule_results were reconstructed from ReviewCache rather
+    # than computed fresh (api_calls_used/spend_usd are 0 in that case, by
+    # construction, not by coincidence) — see app/services/review_cache.py
+    # and run_review's own docstring. Purely informational/transparency —
+    # nothing reads this to make a decision; a reviewer or the CSV export
+    # can see at a glance that a given review was served from a prior
+    # identical run rather than re-computed.
+    served_from_cache = Column(Boolean, nullable=False, default=False)
     # BUG FIX: server_default=func.now() alone truncates to whole-SECOND
     # resolution on SQLite (this suite's own test dialect) — a manual
     # re-run creating a second review for the same document within the
@@ -249,3 +263,52 @@ class AuditLog(Base):
     new_value = Column(JSON, nullable=True)
     actor = Column(String(255), nullable=True)  # None only for system/automated actions
     at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class ReviewCache(Base):
+    """Fix Round (2026-10-05), "non-determinism fix": Krishna reported that
+    uploading the literal same PDF multiple times produced different pass/
+    fail results on a couple of rules between runs — real, expected LLM
+    sampling variance in the judgment layer (see this round's own report;
+    no code-level non-determinism was found anywhere upstream of the real
+    model call). Decision: a genuinely identical document must produce a
+    genuinely identical STORED verdict, full stop, not "usually" the same
+    one — guaranteed here by reusing a prior run's real result instead of
+    re-computing it, rather than by trying to make the model itself more
+    consistent (see app/services/review_cache.py for the full mechanism).
+
+    No hard deletes, same as everywhere else in this schema — a stale row
+    (one whose pipeline_version no longer matches the current one) is
+    simply never matched by a lookup again, never deleted; it stays as a
+    real historical record of what an older pipeline version produced for
+    that same document content.
+
+    (cache_key, pipeline_version) is NOT a composite primary key on
+    purpose — a UNIQUE constraint across both lets a `force_rerun` genuinely
+    REPLACE (UPDATE, not insert-a-second-row) the live cached answer for
+    today's pipeline_version in place, while an old row under a PRIOR
+    pipeline_version is a completely separate, untouched unique combination
+    that simply sits there unread.
+    """
+
+    __tablename__ = "review_cache"
+    __table_args__ = (UniqueConstraint("cache_key", "pipeline_version", name="uq_review_cache_key_version"),)
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    # sha256 hex of this document's own extracted/classified content plus
+    # every other stateless input that can change a finding (service_code,
+    # prior_extractions, timesheet_rows, appendix, sibling_documents) — see
+    # app/services/review_cache.py::compute_cache_key for the precise,
+    # documented definition of "same document" this hashes.
+    cache_key = Column(String(64), nullable=False, index=True)
+    # sha256 hex from agent_client.pipeline_version_fingerprint() — see
+    # that function's own docstring for exactly what it covers.
+    pipeline_version = Column(String(64), nullable=False, index=True)
+    # Everything run_review needs to reconstruct this review's own
+    # RuleResult rows and summary fields WITHOUT re-running anything real —
+    # see app/services/review_cache.py::CachedReviewPayload for the exact
+    # shape.
+    payload = Column(JSON, nullable=False)
+    hit_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow, server_default=func.now())

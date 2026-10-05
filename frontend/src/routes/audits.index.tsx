@@ -34,6 +34,9 @@ function AuditFlagsBadge({ row }: { row: AuditRow }) {
   if (row.processing_status === "skipped_spend_cap") {
     return <Badge variant="secondary" className="bg-warning/20 text-warning-foreground">Skipped (spend cap)</Badge>;
   }
+  if (row.processing_status === "cancelled_spend_cap") {
+    return <Badge variant="secondary" className="bg-warning/20 text-warning-foreground">Cancelled (spend cap)</Badge>;
+  }
   if (row.processing_status === "no_applicable_rules") {
     return <Badge variant="secondary" className="bg-muted text-muted-foreground">No rules apply</Badge>;
   }

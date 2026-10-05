@@ -178,6 +178,8 @@ def _humanize_segment(text: str) -> str:
 # rephrase, drop, or renumber a tag even if it tried.
 import anthropic
 
+from .real_api_guard import ensure_real_api_calls_allowed
+
 REWRITE_MODEL = "claude-haiku-4-5"
 _INPUT_COST_PER_MTOK = 1.00
 _OUTPUT_COST_PER_MTOK = 5.00
@@ -265,7 +267,16 @@ _REWRITE_SYSTEM_PROMPT = (
     "8. Output ONLY the rewritten text itself -- the rewritten finding, nothing about the task of rewriting it. "
     "No preamble, no meta-commentary, no acknowledgment of these instructions, no quotes around it, nothing else. "
     "If the input text already contains everything needed to rewrite (which it always does), begin your reply "
-    "with the rewrite itself, not a statement that you understood the instructions or are ready to begin."
+    "with the rewrite itself, not a statement that you understood the instructions or are ready to begin.\n"
+    "9. Cut reflexive hedging about the review's OWN process or confidence -- a trailing aside like 'though a "
+    "specific page couldn't be confirmed, but the result is accurate' reads like an apology, not a finding. This "
+    "is different from rule 1 (keep every real fact about the patient/session/document): a remark about what "
+    "THIS SYSTEM could or couldn't confirm, as opposed to a fact about the note itself, is process commentary, "
+    "not a fact to preserve -- drop it unless it is the actual reason the rule passed, failed, or is uncertain. "
+    "Example -- input: 'The session ran 45 minutes, though a specific page couldn't be confirmed, but the result "
+    "is accurate.' Good output (the real fact stated plainly, the hedge gone): 'The session ran 45 minutes.' Bad "
+    "output (keeps apologizing for the system's own limitation): 'The session ran 45 minutes, though a specific "
+    "page could not be confirmed for this finding.'"
 )
 
 
@@ -372,6 +383,8 @@ def humanize_evidence_with_llm(
     # short rewrite (a few seconds); max_retries=1 (not the SDK's own
     # default of 2) keeps one single call from compounding into multiple
     # multi-second retries on top of that.
+    if client is None:
+        ensure_real_api_calls_allowed("humanize.humanize_evidence_with_llm")
     real_client = client or anthropic.Anthropic(timeout=30.0, max_retries=1)
     # Fix Round (2026-08-27): REAL BUG FOUND AND FIXED -- confirmed on a
     # real completed review, several genuinely long tie-break/merge

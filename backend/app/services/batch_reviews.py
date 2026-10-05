@@ -52,10 +52,23 @@ def run_batch_reviews(batch_id: str) -> None:
             .order_by(PersonDocument.page_start.asc())
         ).all()
 
+        # Fix Round (2026-10-05), "per-classified-set spend cap": a set
+        # that hit its OWN per_document_hard_cap_usd ceiling mid-review
+        # (status="cancelled_spend_cap") still spent real money before
+        # stopping — that real spend must still count toward the BATCH's
+        # own cumulative cap, same as a normally-"complete" set's spend
+        # does. Counting only "complete" here would let a batch of many
+        # sets that each partially spend right up to their own cap, then
+        # cancel, spend far more real money in total than batch_max_spend_
+        # usd was ever supposed to allow, since none of them individually
+        # ever registered as "complete" spend.
         already_spent = db.execute(
             select(SessionNoteReview)
             .join(PersonDocument, SessionNoteReview.person_document_id == PersonDocument.id)
-            .where(PersonDocument.batch_id == batch_id, SessionNoteReview.status == "complete")
+            .where(
+                PersonDocument.batch_id == batch_id,
+                SessionNoteReview.status.in_(["complete", "cancelled_spend_cap"]),
+            )
         ).scalars().all()
         running_total = sum(r.spend_usd for r in already_spent)
 
@@ -72,7 +85,7 @@ def run_batch_reviews(batch_id: str) -> None:
                 db, review, person_document, batch,
                 actor=None, model_override=None, raise_on_error=False,
             )
-            if review.status == "complete":
+            if review.status in ("complete", "cancelled_spend_cap"):
                 running_total += review.spend_usd
     finally:
         db.close()

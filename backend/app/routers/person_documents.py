@@ -11,18 +11,21 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.agent_client import (
+    SPEND_CAP_EXCEEDED_EXCEPTIONS,
     extract_activity_statement_rows,
     extract_data_points,
     extract_document_summary_fields,
     extract_pdf_full_text,
     extract_session_note_data,
     humanize_findings_batch,
+    pipeline_version_fingerprint,
     review_person_document,
 )
 from app.audit import record as audit_record
 from app.config import settings
 from app.db.base import get_db
 from app.db.models import Person, PersonDocument, RuleResult, SessionNoteBatch, SessionNoteReview
+from app.services import review_cache as review_cache_module
 from app.services.pdf_slicing import slice_pdf_to_temp_file
 from app.services.review import compute_score_and_audit_result, finding_group, has_applicable_rules, load_rules_by_id
 
@@ -34,6 +37,13 @@ router = APIRouter(tags=["person_documents"])
 class ReviewRequestIn(BaseModel):
     actor: str | None = None  # who triggered this review run (audit actor)
     model_override: str | None = None  # None = real Anthropic path; anything else = agent-making's dev/OpenRouter path
+    # Fix Round (2026-10-05), "non-determinism fix": true deliberately
+    # bypasses the review-result cache lookup (see run_review's own
+    # docstring) — a reviewer re-evaluating a document on their own
+    # judgment, not blocked behind a rules/prompt change. Still a REAL,
+    # billed re-run; still writes its fresh result into the cache
+    # afterward.
+    force_rerun: bool = False
 
 
 class RuleResultOut(BaseModel):
@@ -77,6 +87,11 @@ class ReviewOut(BaseModel):
     session_end_time: str | None
     api_calls_used: int
     spend_usd: float
+    # Fix Round (2026-10-05), "non-determinism fix": true when this
+    # review's results were reused from an identical prior run rather than
+    # computed fresh (api_calls_used/spend_usd are 0 in that case) — see
+    # app/services/review_cache.py.
+    served_from_cache: bool
     grouped_results: dict[str, list[RuleResultOut]]
 
 
@@ -114,6 +129,7 @@ def _review_out(review: SessionNoteReview, person_document: PersonDocument, pers
         provider_name=review.provider_name, bcba_name=review.bcba_name,
         session_start_time=review.session_start_time, session_end_time=review.session_end_time,
         api_calls_used=review.api_calls_used, spend_usd=review.spend_usd,
+        served_from_cache=review.served_from_cache,
         grouped_results=_build_grouped_results(review.rule_results),
     )
 
@@ -126,11 +142,43 @@ def _finding_text(evidence) -> str | None:
     return None
 
 
-def _load_prior_extractions(db: Session, person_document: PersonDocument) -> list[dict] | None:
+def _load_prior_extractions(
+    db: Session, person_document: PersonDocument, *, current_full_text: str | None = None,
+) -> list[dict] | None:
     """This person's OTHER, already-reviewed documents of the SAME service
     code, as plain data — agent-making stays stateless (see CLAUDE.md /
     docs/backend-agent-making-plan.md); this is the one place the backend
     actually fetches history before handing it over.
+
+    REAL BUG FOUND AND FIXED (2026-10-05, "cross-upload history leak"):
+    the `active=True` filter below already excludes an ARCHIVED duplicate
+    of this same real visit (see that filter's own comment — a real
+    Joseph Bergstein 97153 CSV audit caught that one), but it does NOT
+    exclude a SECOND, still-ACTIVE upload of the byte-identical document —
+    confirmed real: re-uploading Krishna's own real "daniel aiza.pdf" a
+    second time made the FIRST upload's own Daniel Cazi document count as
+    a genuine "prior session" for the second upload's own Daniel Cazi
+    document, even though they are the exact same real visit, re-processed
+    twice. A needs_history rule (e.g. "does this narrative duplicate a
+    prior note word-for-word?") then compares a document against an
+    archived-in-spirit copy of ITSELF and could flag a false positive, or
+    a history-trend rule could silently double-count one real visit as
+    two. This is a correctness bug independent of (and in addition to) the
+    real LLM judgment-sampling variance fixed earlier the same round — it
+    affects any needs_history rule, not just the one that happened to
+    surface it.
+
+    Fixed by excluding any candidate row whose OWN stored full_text is
+    byte-identical to `current_full_text` — content identity, not upload
+    timestamp/batch/id, is what actually makes two rows "the same real
+    visit" vs. "two real, separate sessions that happen to share a date."
+    Exact string equality is deliberate, not a hash: extraction is already
+    confirmed deterministic for identical PDF bytes (see agent-making's
+    own test_review_repeatability.py), so a genuine re-upload of the same
+    document always produces byte-identical full_text, making this
+    precise rather than approximate. `current_full_text=None` (a caller
+    that hasn't extracted it yet) disables this specific check — the
+    archived-duplicate and basic recency filters below still apply.
     """
     if person_document.person_id is None:
         return None
@@ -162,12 +210,12 @@ def _load_prior_extractions(db: Session, person_document: PersonDocument) -> lis
         # original query had no ORDER BY at all (undefined row order).
         .order_by(PersonDocument.date_of_service.asc())
     ).all()
-    if not rows:
-        return None
-    return [
+    results = [
         {"date_of_service": pd.date_of_service.isoformat() if pd.date_of_service else None, "full_text": review.full_text}
         for review, pd in rows
+        if current_full_text is None or review.full_text != current_full_text
     ]
+    return results or None
 
 
 def _load_sibling_documents(db: Session, batch: SessionNoteBatch, person_document: PersonDocument) -> list[dict] | None:
@@ -227,6 +275,7 @@ def run_review(
     actor: str | None = None,
     model_override: str | None = None,
     raise_on_error: bool = True,
+    force_rerun: bool = False,
 ) -> SessionNoteReview:
     """Runs the real pipeline for an EXISTING (already flushed) review row —
     the one place both the manual re-run endpoint below and the automatic
@@ -259,11 +308,23 @@ def run_review(
     left to fail on its own. This makes it structurally impossible for
     the three stages combined to exceed the cap, regardless of which one
     would otherwise have been the big spender.
+
+    CACHING (Fix Round 2026-10-05, "non-determinism fix"): once the
+    zero-cost setup below (full_text/summary_fields/timesheet_rows) is
+    available, this document's own cache key is computed (see
+    app/services/review_cache.py::compute_cache_key) and looked up against
+    the CURRENT pipeline_version_fingerprint(). A hit reconstructs this
+    review's RuleResult rows directly from the cached payload — zero real
+    calls, api_calls_used/spend_usd=0, served_from_cache=True — and skips
+    the entire retry loop/real pipeline below. `force_rerun=True` skips
+    the LOOKUP only (a reviewer's deliberate "re-evaluate this on its own
+    merits" action); the real run that follows still WRITES its fresh
+    result into the cache afterward, becoming the new cached answer for
+    future automatic lookups of this same (cache_key, pipeline_version).
     """
     review.status = "processing"
     db.commit()
 
-    prior_extractions = _load_prior_extractions(db, person_document)
     sibling_documents = _load_sibling_documents(db, batch, person_document)
     sliced_path = slice_pdf_to_temp_file(batch.original_pdf_path, person_document.page_start, person_document.page_end)
 
@@ -271,6 +332,13 @@ def run_review(
         full_text = extract_pdf_full_text(sliced_path)
         summary_fields = extract_document_summary_fields(sliced_path)
         review.full_text = full_text
+        # Moved here (was before full_text existed) so the "exclude a
+        # byte-identical re-upload from this document's own prior-session
+        # pool" check (see this function's own docstring, "cross-upload
+        # history leak") has the current document's real text to compare
+        # against — a no-op difference for the SPEND-cap-irrelevant
+        # zero-cost query ordering, not a stage reordering of anything billed.
+        prior_extractions = _load_prior_extractions(db, person_document, current_full_text=full_text)
         review.provider_name = summary_fields["provider_name"]
         review.bcba_name = summary_fields["bcba_name"]
         review.session_start_time = summary_fields["session_start_time"]
@@ -289,6 +357,65 @@ def run_review(
             db.commit()
             os.unlink(sliced_path)
             return review
+
+        # Zero-cost — same Activity Statement parse every attempt would
+        # otherwise redo inside the retry loop; computed once, up front,
+        # both for the real pipeline call below AND for the cache key
+        # (this is a real input to the rule-checking pipeline — the SAME
+        # document with a DIFFERENT timesheet row attached is a genuinely
+        # different review, so it must be part of "same document").
+        timesheet_rows = (
+            extract_activity_statement_rows(batch.original_pdf_path, person_document.activity_statement_page)
+            if person_document.activity_statement_page is not None
+            else None
+        )
+
+        cache_key = review_cache_module.compute_cache_key(
+            full_text=full_text, service_code=person_document.service_code,
+            prior_extractions=prior_extractions, timesheet_rows=timesheet_rows,
+            appendix=person_document.appendix, sibling_documents=sibling_documents,
+        )
+        pipeline_version = pipeline_version_fingerprint()
+
+        if not force_rerun:
+            cached = review_cache_module.lookup(db, cache_key=cache_key, pipeline_version=pipeline_version)
+            if cached is not None:
+                review_cache_module.record_hit(db, cached)
+                rule_results = [
+                    RuleResult(
+                        review_id=review.id, rule_id=rule_id,
+                        check_type=f["check_type"], model_status=f["model_status"],
+                        model_finding=f["model_finding"], model_finding_raw=f["model_finding_raw"],
+                        model_evidence=f["model_evidence"], model_page=f["model_page"],
+                        model_confidence=f["model_confidence"],
+                        final_status=f["model_status"], final_finding=f["model_finding"],
+                        final_pages=f["model_page"],
+                    )
+                    for rule_id, f in cached.payload["findings"].items()
+                ]
+                for rr in rule_results:
+                    db.add(rr)
+                db.flush()
+                review.extraction = cached.payload["review_extraction"]
+                review.score, review.audit_result = compute_score_and_audit_result(rule_results)
+                review.api_calls_used = 0
+                review.spend_usd = 0.0
+                review.served_from_cache = True
+                review.status = "complete"
+                audit_record(
+                    db, entity_type="session_note_review", entity_id=review.id,
+                    changes={
+                        "status": ("processing", "complete"),
+                        "audit_result": (None, review.audit_result),
+                        "score": (None, review.score),
+                        "served_from_cache": (False, True),
+                    },
+                    actor=actor,
+                )
+                db.commit()
+                db.refresh(review)
+                os.unlink(sliced_path)
+                return review
 
         db.commit()
     except Exception:  # noqa: BLE001 — this zero-cost setup phase has no real spend to lose; not worth retrying
@@ -322,6 +449,13 @@ def run_review(
     extraction: dict | None = None
     result = None
     last_traceback: str | None = None
+    # Fix Round (2026-10-05), "per-classified-set spend cap": true only
+    # when a SPEND_CAP_EXCEEDED_EXCEPTIONS was actually raised directly
+    # from extract_session_note_data (the one real call site in this loop
+    # that can raise one uncaught, rather than reporting it through
+    # review_person_document's own structured status="error" return) —
+    # decides status="cancelled_spend_cap" vs status="failed" below.
+    cap_exceeded_hit = False
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -334,19 +468,9 @@ def run_review(
             data_points = extract_data_points(sliced_path)
             review.extraction = {"fields": extraction["fields"], "data_points": data_points}
 
-            # The Activity Statement is the SAME batch PDF's own cover
-            # page (already sitting in original_pdf_path — no second
-            # upload), parsed zero-cost. None only when this batch
-            # genuinely has no cover page recorded for this person (see
-            # PersonDocument.activity_statement_page's own docstring) —
-            # timesheet-alignment checks correctly stay not_checkable
-            # in that case, never silently guessed at.
-            timesheet_rows = (
-                extract_activity_statement_rows(batch.original_pdf_path, person_document.activity_statement_page)
-                if person_document.activity_statement_page is not None
-                else None
-            )
-
+            # timesheet_rows already computed once, above, before the
+            # cache-key/lookup — same Activity Statement data every retry
+            # attempt would otherwise recompute identically.
             remaining_budget = max(0.0, settings.per_document_hard_cap_usd - accumulated_cost_usd)
             result = review_person_document(
                 sliced_path, person_document.service_code,
@@ -381,6 +505,24 @@ def run_review(
                     continue
                 break
             break  # success, or a deliberate non-retryable error — stop retrying
+        except SPEND_CAP_EXCEEDED_EXCEPTIONS as exc:
+            # Fix Round (2026-10-05), "per-classified-set spend cap": this
+            # ONE set's own per_document_hard_cap_usd ceiling was hit mid-
+            # review (extract_session_note_data raised directly — unlike
+            # review_person_document, which never lets this escape as a
+            # raised exception, see the structured status="error" branch
+            # above). Never retried — the next attempt would recompute an
+            # identical ~$0 remaining budget and hit the exact same cap
+            # immediately, burning a retry/backoff cycle for a guaranteed
+            # repeat of the same outcome. Stops this set here, cleanly.
+            last_traceback = str(exc)
+            cap_exceeded_hit = True
+            logger.warning(
+                "person_document_id=%s hit its per-classified-set spend cap mid-review "
+                "(accumulated so far: $%.4f): %s",
+                person_document.id, accumulated_cost_usd, last_traceback,
+            )
+            break
         except Exception:  # noqa: BLE001 — an honest "failed" status, never a bare 500 mid-batch
             # The FULL traceback, not just str(exc) — the previous,
             # message-only form made a real production crash
@@ -396,6 +538,23 @@ def run_review(
             )
             if attempt < max_attempts:
                 time.sleep(settings.review_retry_backoff_seconds)
+
+    if cap_exceeded_hit:
+        # Distinct from status="failed" on purpose (see SessionNoteReview.
+        # status's own docstring) — a deliberate, expected safety stop,
+        # never a bug. Other sets in the same batch are entirely
+        # unaffected: batch_reviews.py calls run_review once per document,
+        # in its own try/except-free loop iteration — this return here
+        # never raises past this function (raise_on_error=True callers are
+        # the manual endpoint only, where a 4xx-shaped response, not a
+        # retry, is the right reaction to a deliberate cap trip).
+        review.status = "cancelled_spend_cap"
+        review.error_message = last_traceback
+        review.spend_usd = accumulated_cost_usd
+        review.api_calls_used = accumulated_calls
+        db.commit()
+        os.unlink(sliced_path)
+        return review
 
     if result is None:
         # Every attempt either raised or came back as an unexpected error,
@@ -415,7 +574,12 @@ def run_review(
         # Only a deliberate, non-retryable error (error_type="cap_exceeded")
         # can reach here — an "unexpected" one either succeeded on a later
         # attempt or was already handled by the result-is-None branch above.
-        review.status = "failed"
+        # Fix Round (2026-10-05), "per-classified-set spend cap": this IS
+        # that same deliberate cap trip, just reported through review_
+        # person_document's own structured return instead of a raised
+        # exception — same "cancelled_spend_cap" status as the other path
+        # above, never "failed" (a bug/crash status this explicitly is not).
+        review.status = "cancelled_spend_cap"
         review.error_message = result.error
         # accumulated_cost_usd/accumulated_calls already include every
         # attempt's own extraction cost (including any earlier attempt
@@ -522,6 +686,31 @@ def run_review(
         # batch-spend-cap blind spot).
         review.spend_usd = accumulated_cost_usd + result.usage.estimated_cost_usd + humanize_cost_usd
         review.status = "complete"
+        review.served_from_cache = False
+
+        # Writes (or replaces, in place) the live cached answer for this
+        # exact (cache_key, pipeline_version) — becomes the result a FUTURE
+        # automatic lookup of this same document/pipeline reuses, including
+        # when THIS run was itself a force_rerun. See review_cache.upsert's
+        # own docstring for why a force_rerun still updates the cache.
+        review_cache_module.upsert(
+            db, cache_key=cache_key, pipeline_version=pipeline_version,
+            payload={
+                "review_extraction": review.extraction,
+                "findings": {
+                    rr.rule_id: {
+                        "check_type": rr.check_type,
+                        "model_status": rr.model_status,
+                        "model_finding": rr.model_finding,
+                        "model_finding_raw": rr.model_finding_raw,
+                        "model_evidence": rr.model_evidence,
+                        "model_page": rr.model_page,
+                        "model_confidence": rr.model_confidence,
+                    }
+                    for rr in rule_results
+                },
+            },
+        )
 
         audit_record(
             db, entity_type="session_note_review", entity_id=review.id,
@@ -581,7 +770,10 @@ def review_document(person_document_id: str, body: ReviewRequestIn, db: Session 
     db.add(review)
     db.flush()
 
-    review = run_review(db, review, person_document, batch, actor=body.actor, model_override=body.model_override)
+    review = run_review(
+        db, review, person_document, batch,
+        actor=body.actor, model_override=body.model_override, force_rerun=body.force_rerun,
+    )
 
     if review.status == "failed":
         # An exception-raising failure already propagated as a bare 500

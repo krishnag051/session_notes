@@ -47,6 +47,7 @@ import requests
 from dotenv import load_dotenv
 
 from . import call_tracker
+from .real_api_guard import ensure_real_api_calls_allowed
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
@@ -127,6 +128,19 @@ class ModelCallError(Exception):
     """Wraps a real failure from either provider's call site (HTTP error,
     missing tool_call in the response, etc.) into one exception type
     callers can catch regardless of which provider actually ran."""
+
+
+class ModelCallCapExceeded(ModelCallError):
+    """Fix Round (2026-10-05), "per-classified-set spend cap": raised by
+    CallTracker.check_before_call() specifically -- a deliberate, expected
+    safety-ceiling trip, never a real provider/network failure. Distinct
+    from the plain ModelCallError superclass (and from TransientModelCallError
+    below) so a caller can tell "stop, don't retry, this will just hit the
+    identical cap again" apart from "a real, possibly-transient failure
+    retrying might actually fix" -- see backend's app/routers/
+    person_documents.py::run_review, which catches this specifically to
+    land on review.status="cancelled_spend_cap" rather than blindly
+    retrying or lumping it in with status="failed"."""
 
 
 class TransientModelCallError(ModelCallError):
@@ -416,6 +430,7 @@ def _call_openrouter(
         }],
         "tool_choice": {"type": "function", "function": {"name": tool_name}},
     }
+    ensure_real_api_calls_allowed("model_provider._call_openrouter")
     response = requests.post(
         OPENROUTER_API_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -482,6 +497,7 @@ def _call_anthropic(
     # (same SDK, same 10-minute DEFAULT_TIMEOUT otherwise) for the full
     # story behind why every real client construction in this pipeline
     # now sets one explicitly.
+    ensure_real_api_calls_allowed("model_provider._call_anthropic")
     client = anthropic.Anthropic(timeout=60.0, max_retries=1)
     response = client.messages.create(
         model=model,
@@ -563,6 +579,7 @@ def call_tool_json_with_images(
     # Explicit, bounded timeout -- see humanize.py's own real-bug comment
     # for the full story; 90s (vs. 60s for the text-only call above) to
     # give a real vision call a bit more headroom.
+    ensure_real_api_calls_allowed("model_provider.call_tool_json_with_images")
     client = anthropic.Anthropic(timeout=90.0, max_retries=1)
     response = client.messages.create(
         model=model,
@@ -652,11 +669,11 @@ class CallTracker:
     def check_before_call(self) -> None:
         with self._lock:
             if self.max_calls is not None and self.count >= self.max_calls:
-                raise ModelCallError(
+                raise ModelCallCapExceeded(
                     f"Refusing call #{self.count + 1}: cap is {self.max_calls}. Stopped before making the call, not after."
                 )
             if self.max_spend_usd is not None and self.estimated_cost_usd >= self.max_spend_usd:
-                raise ModelCallError(
+                raise ModelCallCapExceeded(
                     f"Refusing call #{self.count + 1}: already spent ${self.estimated_cost_usd:.4f}, "
                     f"at or over the ${self.max_spend_usd:.2f} cap. Stopped before making the call, not after."
                 )

@@ -57,17 +57,29 @@ class Settings(BaseSettings):
     # effectively unbounded.
     humanize_max_calls: int = 60
 
-    # HARD, ENFORCED ceiling on ONE document's total real spend, across
-    # ALL THREE real call stages combined (extraction + review + humanize)
-    # — urgent production ask after a review-time regression: "no single
-    # session note's review may spend more than $2 in real API cost...
-    # an actual enforced limit, not just a monitoring/alert". Each stage
-    # in run_review gets only its own REMAINING headroom under this
-    # ceiling as ITS OWN max_spend_usd (never the full $2, and never the
+    # HARD, ENFORCED ceiling on ONE CLASSIFIED SET's (one person's one
+    # session note + its matched activity/supporting data — i.e. one
+    # PersonDocument/SessionNoteReview) total real spend, across ALL THREE
+    # real call stages combined (extraction + review + humanize). Each
+    # stage in run_review gets only its own REMAINING headroom under this
+    # ceiling as ITS OWN max_spend_usd (never the full cap, and never the
     # flat rule_engine_max_spend_usd/session_note extraction caps above,
     # which this can only ever tighten, never loosen) — so the three
     # stages combined structurally cannot exceed this number.
-    per_document_hard_cap_usd: float = 2.00
+    #
+    # RECONCILED (2026-10-05, "per-classified-set spend cap"): this WAS a
+    # looser $2.00 ("no single session note's review may spend more than
+    # $2... an actual enforced limit, not just a monitoring/alert", the
+    # prior urgent production ask). This round's explicit ask named a
+    # tighter $1.40 ceiling for "one classified set" — the SAME unit this
+    # setting already protects, not a second, parallel concept — so this
+    # value was LOWERED to $1.40 rather than adding a differently-named
+    # setting that would do the identical job under a different name.
+    # Real observed per-set cost today is under $0.50 (see this project's
+    # own real-run logs) — $1.40 is a safety ceiling for when something
+    # goes wrong (a retry loop, an unexpectedly large document, a bug),
+    # not a budget expected to actually be used.
+    per_document_hard_cap_usd: float = 1.40
 
     upload_storage_dir: str = "./data/uploads"
 

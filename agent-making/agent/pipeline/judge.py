@@ -23,6 +23,7 @@ import anthropic
 from dotenv import load_dotenv
 
 from .model_provider import call_openrouter_with_fallback, resolve_provider_and_model
+from .real_api_guard import ensure_real_api_calls_allowed
 
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
 
@@ -373,6 +374,7 @@ def _run_judgment_checks_once(
     # 120s here (vs. humanize's 30s) because this is a genuinely heavier
     # call -- a full judgment batch over multiple rules and page images,
     # not a short per-finding rewrite -- still far short of the default.
+    ensure_real_api_calls_allowed("judge._run_judgment_checks_once")
     client = anthropic.Anthropic(timeout=120.0, max_retries=1)
 
     # thinking disabled: this is a bounded classification/extraction task, not

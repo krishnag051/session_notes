@@ -138,7 +138,7 @@ function UploadPage() {
                     <div className="flex items-center gap-2">
                       <Loader2 className="h-4 w-4 animate-spin" />
                       Running compliance review — {reviewSummary.complete + reviewSummary.no_applicable_rules} of{" "}
-                      {reviewSummary.pending + reviewSummary.processing + reviewSummary.complete + reviewSummary.failed + reviewSummary.skipped_spend_cap + reviewSummary.no_applicable_rules}{" "}
+                      {reviewSummary.pending + reviewSummary.processing + reviewSummary.complete + reviewSummary.failed + reviewSummary.skipped_spend_cap + reviewSummary.cancelled_spend_cap + reviewSummary.no_applicable_rules}{" "}
                       documents done so far…
                     </div>
                   ) : (
@@ -147,6 +147,7 @@ function UploadPage() {
                       {reviewSummary.no_applicable_rules > 0 && `, ${reviewSummary.no_applicable_rules} had no applicable rules`}
                       {reviewSummary.failed > 0 && `, ${reviewSummary.failed} failed`}
                       {reviewSummary.skipped_spend_cap > 0 && `, ${reviewSummary.skipped_spend_cap} skipped (spend cap reached)`}
+                      {reviewSummary.cancelled_spend_cap > 0 && `, ${reviewSummary.cancelled_spend_cap} cancelled (hit the per-document spend cap)`}
                     </div>
                   )}
                   <div className="text-xs">

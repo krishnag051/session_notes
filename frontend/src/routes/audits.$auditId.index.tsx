@@ -208,6 +208,20 @@ function ProcessingStatusCard({ status, errorMessage }: { status: string; errorM
       </Card>
     );
   }
+  if (status === "cancelled_spend_cap") {
+    return (
+      <Card className="shadow-card">
+        <CardContent className="flex flex-col items-center gap-2 py-16 text-center text-muted-foreground">
+          <AlertTriangle className="h-10 w-10 text-warning-foreground" />
+          <div className="text-base font-semibold text-foreground">Cancelled — this document's own spend cap was reached</div>
+          <p className="max-w-md text-sm">
+            {errorMessage ?? "This document's review spent up to its own per-document limit before finishing and was stopped."}
+            {" "}Re-run it manually if needed.
+          </p>
+        </CardContent>
+      </Card>
+    );
+  }
   return (
     <Card className="shadow-card">
       <CardContent className="flex flex-col items-center gap-2 py-16 text-center text-muted-foreground">

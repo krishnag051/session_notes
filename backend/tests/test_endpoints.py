@@ -144,6 +144,16 @@ def test_reviewing_a_document_never_counts_it_as_its_own_history(client, monkeyp
     session-scoped and real fixture files map to the same real Person via
     global_key across many tests, so an absolute "no prior review exists
     yet" assumption would be fragile to test execution order.
+
+    force_rerun=True on the SECOND call (Fix Round 2026-10-05, "non-
+    determinism fix"): without it, the second call would be a legitimate
+    review-result CACHE HIT (identical document, identical inputs) and
+    never reach `_fake_review` at all -- correct, intended caching
+    behavior (see app/services/review_cache.py), but it would silently
+    defeat THIS test's own actual point, which is specifically about what
+    prior_extractions gets COMPUTED on a second real run, not about
+    caching. force_rerun deliberately bypasses the cache lookup for this
+    reason, same as a reviewer's own "re-evaluate this" action would.
     """
     batch = _upload_batch(client, "batch_19page_3client.pdf")
     doc = next(d for d in batch["documents"] if d["service_code"] == "97153")
@@ -157,8 +167,9 @@ def test_reviewing_a_document_never_counts_it_as_its_own_history(client, monkeyp
     monkeypatch.setattr(person_documents_module, "review_person_document", _fake_review)
 
     assert client.post(f"/api/person-documents/{doc['id']}/review", json={}).status_code == 201
-    assert client.post(f"/api/person-documents/{doc['id']}/review", json={}).status_code == 201
+    assert client.post(f"/api/person-documents/{doc['id']}/review", json={"force_rerun": True}).status_code == 201
 
+    assert len(captured) == 2
     assert captured[0] == captured[1]
 
 
@@ -187,7 +198,18 @@ def test_review_document_404_for_unknown_id(client):
     assert resp.status_code == 404
 
 
-def test_review_document_502_when_pipeline_returns_error(client, monkeypatch):
+def test_review_document_structured_cap_exceeded_error_lands_on_cancelled_not_502(client, monkeypatch):
+    """Fix Round (2026-10-05), "per-classified-set spend cap": this test
+    used to assert a bare 502 here -- _FakeResult's own default error_type
+    for status="error" is "cap_exceeded" (see its own definition above),
+    and the ONLY way run_review's retry loop can reach its result.status==
+    "error" branch at all is error_type=="cap_exceeded" (an "unexpected"
+    error_type is retried/converted to a raised 500 instead, never reaches
+    here) -- so this test was ALWAYS exercising the cap-exceeded path,
+    just not labeled that way. A deliberate cap trip is no longer treated
+    as an HTTP-level failure -- it's a distinct, inspectable
+    status="cancelled_spend_cap", same as the automatic batch path
+    already treats it, not a 502."""
     batch = _upload_batch(client, "batch_19page_3client.pdf")
     doc = next(d for d in batch["documents"] if d["service_code"] == "97153")
     monkeypatch.setattr(
@@ -195,7 +217,8 @@ def test_review_document_502_when_pipeline_returns_error(client, monkeypatch):
         lambda *a, **k: _FakeResult({}, status="error", error="simulated pipeline failure"),
     )
     resp = client.post(f"/api/person-documents/{doc['id']}/review", json={})
-    assert resp.status_code == 502
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["status"] == "cancelled_spend_cap"
 
 
 def test_get_person_document_works_before_any_review_exists(client):

@@ -48,21 +48,46 @@ from agent.pipeline.activity_statement import (  # noqa: E402
     parse_activity_statement_rows as _parse_activity_statement_rows,
 )
 from agent.pipeline.api import classify_batch_pdf as _classify_batch_pdf  # noqa: E402
+from agent.pipeline.api import pipeline_version_fingerprint as _pipeline_version_fingerprint  # noqa: E402
 from agent.pipeline.api import review_person_document as _review_person_document  # noqa: E402
+from agent.pipeline.call_tracker import ApiCallCapExceeded  # noqa: E402
+from agent.pipeline.call_tracker import ApiSpendCapExceeded  # noqa: E402
 from agent.pipeline.extract import extract_pdf_text as _extract_pdf_text  # noqa: E402
 from agent.pipeline.humanize import humanize_findings_batch as _humanize_findings_batch  # noqa: E402
 from agent.pipeline.model_provider import CallTracker as _CallTracker  # noqa: E402
+from agent.pipeline.model_provider import ModelCallCapExceeded  # noqa: E402
 from agent.pipeline.session_note_extraction import (  # noqa: E402
     extract_session_note_file as _extract_session_note_file,
 )
 
 _RULES_JSON_PATH = _AGENT_MAKING_PATH / "agent" / "rules" / "rules.json"
 
+# Fix Round (2026-10-05), "per-classified-set spend cap": every real spend-
+# cap exception this backend's three real call stages can raise — from
+# BOTH of agent-making's two tracker implementations (call_tracker.
+# ApiCallTracker, used by review_person_document's own judgment layer; and
+# model_provider.CallTracker, used by extract_session_note_data and
+# humanize_findings_batch). A deliberate, expected safety-ceiling trip,
+# never a real provider/network failure — see run_review's own use of
+# this tuple for why it's caught separately from "unexpected" exceptions
+# and never retried.
+SPEND_CAP_EXCEEDED_EXCEPTIONS = (ApiCallCapExceeded, ApiSpendCapExceeded, ModelCallCapExceeded)
+
 
 def classify_batch_pdf(pdf_path: str) -> dict:
     """See agent-making/agent/pipeline/classify_batch.py for the full
     BatchClassificationResult shape. Zero model calls."""
     return _classify_batch_pdf(pdf_path)
+
+
+def pipeline_version_fingerprint() -> str:
+    """See agent-making/agent/pipeline/api.py's own docstring — a sha256
+    hex digest over rules.json plus every pipeline module that can change
+    a finding's result/evidence text. app/services/review_cache.py uses
+    this as half of its cache key (the other half is the document content
+    hash) so a stale cached verdict can never be served after a rules/
+    prompt change. Zero model calls."""
+    return _pipeline_version_fingerprint()
 
 
 def extract_pdf_full_text(pdf_path: str) -> str:
@@ -86,7 +111,15 @@ def extract_document_summary_fields(pdf_path: str) -> dict:
     fields = {"pages": pages, "full_text": "\n\n".join(p["text"] for p in pages)}
     return {
         "provider_name": _fields_module.provider_name(fields),
-        "bcba_name": _fields_module.bcba_lba_header_name(fields),
+        # bcba_display_name(), NOT bcba_lba_header_name() directly — falls
+        # back to the provider's own name when the note's template has no
+        # separate 'BCBA/LBA:' field AND the provider's own credentials
+        # include BCBA (97151/97156 notes: the provider IS the BCBA, one
+        # person, not two). SN-97153-05's own judgment check is unaffected
+        # — it calls bcba_lba_header_name() directly, unchanged. See
+        # fields.py::bcba_display_name's own docstring for the real-data
+        # evidence behind this.
+        "bcba_name": _fields_module.bcba_display_name(fields),
         "session_start_time": _fields_module.session_start_time(fields),
         "session_end_time": _fields_module.session_end_time(fields),
     }

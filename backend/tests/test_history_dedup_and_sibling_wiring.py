@@ -1,4 +1,5 @@
-"""Three real bugs found via a real, manual CSV audit (Bergstein/Cazi):
+"""Four real bugs found via real, manual audits (Bergstein/Cazi, then
+Krishna's own real "daniel aiza.pdf" re-upload):
 1. An ARCHIVED duplicate PersonDocument (the same real visit re-uploaded
    in a separate batch) was still counted as genuine "prior session"
    history, producing a false 100% self-similarity match.
@@ -7,6 +8,13 @@
    exception -- the backend's retry mechanism never actually retried it.
 3. SN-97151-11 only ever looked at the single document being reviewed,
    never this person's OTHER documents in the same batch/upload.
+4. "cross-upload history leak" (2026-10-05): an ACTIVE second upload of
+   the byte-identical document (not an archived duplicate -- a genuine,
+   still-active second PersonDocument row with identical content) was
+   STILL counted as real prior history, confirmed via Krishna's own real
+   re-upload of "daniel aiza.pdf". Fixed by excluding any candidate row
+   whose own full_text exactly matches the document currently being
+   reviewed -- see _load_prior_extractions's own updated docstring.
 All exercised here against the mocked model boundary, zero real spend.
 """
 from pathlib import Path
@@ -91,6 +99,61 @@ def test_load_prior_extractions_excludes_an_archived_duplicate_document(client, 
     assert not any(p["full_text"] == "duplicate content" for p in prior)
 
 
+def test_load_prior_extractions_excludes_an_active_byte_identical_reupload(client, monkeypatch, db_session):
+    """Real bug (2026-10-05, "cross-upload history leak"): re-uploading
+    the literal SAME real document as a genuinely separate, still-ACTIVE
+    PersonDocument (not an archived one -- a real second upload, exactly
+    what Krishna did with his own real "daniel aiza.pdf") made the first
+    upload count as real prior history for the second. A needs_history
+    rule then compares a document against a copy of itself as if it were
+    a real separate visit. Confirmed and fixed in app/routers/
+    person_documents.py::_load_prior_extractions (content-identity check,
+    not just the pre-existing active=True archived-duplicate filter).
+    """
+    from app.agent_client import extract_pdf_full_text
+    from app.db.models import PersonDocument, SessionNoteReview
+    from app.services.pdf_slicing import slice_pdf_to_temp_file
+
+    _mock_extraction(monkeypatch)
+    captured = {}
+
+    def _capture_review(*a, prior_extractions=None, **k):
+        captured["prior_extractions"] = prior_extractions
+        return _FakeResult()
+
+    monkeypatch.setattr(person_documents_module, "review_person_document", _capture_review)
+
+    batch = _upload_batch(client)
+    doc = next(d for d in batch["documents"] if d["service_code"] == "97153")
+    person_document = db_session.get(PersonDocument, doc["id"])
+
+    # The REAL, zero-cost extracted text for this exact real document --
+    # not a synthetic string -- so the duplicate below is genuinely
+    # content-identical, the same way a real re-upload would be.
+    sliced_path = slice_pdf_to_temp_file(
+        person_document.batch.original_pdf_path, person_document.page_start, person_document.page_end,
+    )
+    real_full_text = extract_pdf_full_text(sliced_path)
+
+    duplicate = PersonDocument(
+        batch_id=batch["id"], person_id=person_document.person_id,
+        service_code="97153", date_of_service=person_document.date_of_service,
+        appendix="I", page_start=1, page_end=1, classification_confidence="confident", active=True,
+    )
+    db_session.add(duplicate)
+    db_session.flush()
+    db_session.add(SessionNoteReview(person_document_id=duplicate.id, status="complete", full_text=real_full_text))
+    db_session.commit()
+
+    resp = client.post(f"/api/person-documents/{doc['id']}/review", json={})
+    assert resp.status_code == 201, resp.text
+
+    prior = captured["prior_extractions"] or []
+    assert not any(p["full_text"] == real_full_text for p in prior), (
+        "the active, byte-identical duplicate must be excluded from this document's own prior-session pool"
+    )
+
+
 def test_retry_loop_retries_an_unexpected_structured_error_and_then_succeeds(client, monkeypatch):
     """Real bug: review_person_document's own blanket exception handler
     returns status="error" instead of raising -- the retry loop must treat
@@ -118,8 +181,13 @@ def test_retry_loop_retries_an_unexpected_structured_error_and_then_succeeds(cli
 
 def test_retry_loop_does_not_retry_a_cap_exceeded_structured_error(client, monkeypatch):
     """A deliberate limit (spend/call cap) retrying would just waste
-    another real call for the identical outcome -- must fail immediately,
-    not retry."""
+    another real call for the identical outcome -- must stop immediately,
+    not retry. Fix Round (2026-10-05), "per-classified-set spend cap":
+    this no longer returns 502/status="failed" -- a cap trip is now its
+    own distinct, non-error status, status="cancelled_spend_cap" (see
+    app/db/models.py::SessionNoteReview.status's own docstring); the
+    "never retried" assertion (calls["count"] == 1) is this test's own
+    real, still-current point and is unchanged."""
     _mock_extraction(monkeypatch)
     calls = {"count": 0}
 
@@ -132,9 +200,9 @@ def test_retry_loop_does_not_retry_a_cap_exceeded_structured_error(client, monke
     batch = _upload_batch(client)
     doc = next(d for d in batch["documents"] if d["service_code"] == "97153")
     resp = client.post(f"/api/person-documents/{doc['id']}/review", json={})
-    assert resp.status_code == 502  # this endpoint's existing, pre-this-phase contract for a failed review
+    assert resp.status_code == 201, resp.text
     review = client.get(f"/api/person-documents/{doc['id']}/review").json()
-    assert review["status"] == "failed"
+    assert review["status"] == "cancelled_spend_cap"
     assert calls["count"] == 1  # no retry at all
 
 

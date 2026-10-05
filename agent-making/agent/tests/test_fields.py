@@ -260,3 +260,52 @@ def test_run_deterministic_checks_skips_inactive_and_non_deterministic_rules():
     det_results, escalated = fields_module.run_deterministic_checks(rules, _fields(SAMPLE_97153_TEXT))
     assert det_results == {}
     assert escalated == []
+
+
+def test_bcba_display_name_real_97151_cazi_document_falls_back_to_provider():
+    """BUG found by direct inspection of the live app (Daniel Cazi's real
+    97151 document, header card showed BCBA as a bare '-'): this note's
+    own template has NO separate 'BCBA/LBA:' header field at all -- the
+    provider IS the BCBA ('Provider Name: Cindy Rodriguez-Sumner, BCBA,
+    LBA', one person, not two). bcba_lba_header_name() correctly returns
+    None here (there's genuinely no second field); bcba_display_name()
+    must fall back to the provider's own name instead of showing blank.
+    """
+    f = _real_fields("single_doc_97151_cazi_appendix1.pdf", service_code="97151")
+    assert fields_module.bcba_lba_header_name(f) is None
+    assert fields_module.bcba_display_name(f) == "Cindy Rodriguez-Sumner"
+
+
+def test_bcba_display_name_real_97153_document_still_uses_the_real_header_field():
+    """Scope check: a real 97153 note DOES carry a genuine, distinct
+    'BCBA/LBA:' header field (the on-site provider there is a BT, not a
+    BCBA, so the supervising BCBA is really a separate named person) --
+    bcba_display_name() must keep using that real field, never fall back
+    to the provider's own name on this service code.
+    """
+    f = _real_fields("single_doc_97153_bergstein_v2.pdf", service_code="97153")
+    header_name = fields_module.bcba_lba_header_name(f)
+    assert header_name is not None
+    assert fields_module.bcba_display_name(f) == header_name
+
+
+def test_bcba_display_name_does_not_guess_when_provider_has_no_bcba_credential():
+    no_bcba_text = SAMPLE_97153_TEXT.replace("BCBA/LBA: John Doe BCBA, LBA\n", "")
+    f = _fields(no_bcba_text)
+    assert fields_module.bcba_lba_header_name(f) is None
+    assert fields_module.bcba_display_name(f) is None
+
+
+def test_SN_97153_05_unaffected_by_bcba_display_name_fallback():
+    """Explicit scope confirmation (asked for directly in the bug report):
+    SN-97153-05's own checker calls bcba_lba_header_name() directly and is
+    untouched by bcba_display_name()'s fallback -- re-run the existing
+    mismatch/match fixtures to confirm the rule's own real-data behavior
+    is identical to before this fix.
+    """
+    supervised_text = SAMPLE_97153_TEXT.replace(
+        "Was this session Supervised by the BCBA/LBA?\nNo", "Was this session Supervised by the BCBA/LBA?\nYes",
+    )
+    assert fields_module._check_SN_97153_05(_fields(supervised_text))["result"] == "fail"
+    matching_text = supervised_text.replace("BCBA/LBA: John Doe BCBA, LBA", "BCBA/LBA: Jane Smith BCBA, LBA")
+    assert fields_module._check_SN_97153_05(_fields(matching_text))["result"] == "pass"

@@ -37,6 +37,11 @@ class ReviewSummaryOut(BaseModel):
     complete: int
     failed: int
     skipped_spend_cap: int
+    # Fix Round (2026-10-05), "per-classified-set spend cap": a distinct
+    # count from both failed (a bug/crash) and skipped_spend_cap (never
+    # even started, batch cap already hit) — this one DID start and spent
+    # real money before stopping at its own per-set ceiling.
+    cancelled_spend_cap: int
     no_applicable_rules: int
     total_api_calls: int
     total_spend_usd: float
@@ -77,7 +82,10 @@ def _review_summary(db: Session, batch_id: str) -> ReviewSummaryOut:
         .where(LatestReview.id == latest_review_id)
     ).scalars().all()
 
-    counts = {"pending": 0, "processing": 0, "complete": 0, "failed": 0, "skipped_spend_cap": 0, "no_applicable_rules": 0}
+    counts = {
+        "pending": 0, "processing": 0, "complete": 0, "failed": 0,
+        "skipped_spend_cap": 0, "cancelled_spend_cap": 0, "no_applicable_rules": 0,
+    }
     for r in reviews:
         counts[r.status] = counts.get(r.status, 0) + 1
     return ReviewSummaryOut(

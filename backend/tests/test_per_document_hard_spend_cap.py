@@ -7,6 +7,8 @@ never exceed the cap. Mocked model boundary throughout, zero real spend.
 """
 from pathlib import Path
 
+import pytest
+
 import app.routers.person_documents as person_documents_module
 from app.config import settings
 
@@ -69,8 +71,13 @@ def test_review_person_document_gets_reduced_budget_after_extraction_spends_some
     doc = next(d for d in batch["documents"] if d["service_code"] == "97153")
     resp = client.post(f"/api/person-documents/{doc['id']}/review", json={})
     assert resp.status_code == 201, resp.text
-    # $2.00 cap - $0.75 already spent on extraction = $1.25 left for review.
-    assert captured["review_max_spend_usd"] == round(settings.per_document_hard_cap_usd - 0.75, 10)
+    # Cap - $0.75 already spent on extraction = whatever's left for review.
+    # pytest.approx (not a bare ==) -- a float subtraction/max(0.0, ...)
+    # round-trip through run_review doesn't always land on the exact same
+    # bit pattern as this test's own independent subtraction (confirmed
+    # real: 1.4 - 0.75 computed two different ways produced 0.65 vs
+    # 0.6499999999999999 -- a real float-representation fact, not a bug).
+    assert captured["review_max_spend_usd"] == pytest.approx(settings.per_document_hard_cap_usd - 0.75)
 
 
 def test_humanize_pass_gets_zero_budget_once_extraction_and_review_already_hit_the_cap(client, monkeypatch):

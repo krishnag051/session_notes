@@ -90,6 +90,20 @@ services:
       # the real value never sits in a file this repo would ever commit.
       # Unset means a real review fails closed (the safe default); a real
       # key means it runs for real.
+      # Fix Round (2026-10-05), "structural gate for the debug-script
+      # incident": every real call site in agent-making now refuses to run
+      # unless this is explicitly "1" — see agent-making/agent/pipeline/
+      # real_api_guard.py. This staging backend IS the real, intentional
+      # "serves real reviews" process, so it sets this itself.
+      ALLOW_REAL_API_CALLS: "1"
+      # Explicit here too (2026-10-05 pre-deploy review), same reasoning
+      # as docker-compose.yml's own identical block — not left to
+      # silently fall back to app/config.py's own code defaults.
+      # PER_DOCUMENT_HARD_CAP_USD is the per-classified-set hard cap —
+      # lowered from $2.00 to $1.40 this round (see app/config.py).
+      PER_DOCUMENT_HARD_CAP_USD: "1.40"
+      BATCH_MAX_SPEND_USD: "4.00"
+      RULE_ENGINE_MAX_SPEND_USD: "4.00"
     ports:
       # Final: distinct from the old TP-review staging stack's 8001
       # (backend) / 3001 (frontend) / 5433 (postgres).

@@ -141,6 +141,41 @@ def bcba_lba_header_name(fields: dict) -> str | None:
     return m.group(1).strip() if m else None
 
 
+def bcba_display_name(fields: dict) -> str | None:
+    """For the audit header card only (agent_client.py's structural
+    extraction) — NEVER used by SN-97153-05 (that rule calls
+    bcba_lba_header_name directly and unchanged, since it's a real,
+    distinct-person string comparison that only applies to 97153 notes).
+
+    Real bug (found by direct inspection of the live app on two real
+    97151 documents, Daniel Cazi/Aiza Nabiha): a 97151 (BCBA Behavior
+    Identification Assessment) or 97156 (BCBA Family Adaptive Behavior)
+    note's own template has NO separate 'BCBA/LBA:' header field at all —
+    confirmed against every real fixture PDF in this suite. On those two
+    service codes the provider themselves IS the BCBA ('Provider Name:
+    Cindy Rodriguez-Sumner, BCBA, LBA' — one person, not two), so
+    bcba_lba_header_name() correctly returns None (there is genuinely no
+    second field to find), but the header card then showed a bare '—' as
+    if the data were simply missing. A 97153 (RBT/BT) note, by contrast,
+    really does carry a distinct 'BCBA/LBA:' field for the supervising
+    BCBA, since the on-site provider there is a BT, not a BCBA — confirmed
+    this label is present on every real 97153 fixture. So: fall back to
+    the provider's own name ONLY when (a) no distinct header field exists
+    and (b) the provider's own credentials line literally includes
+    'BCBA' — never invented, never a guess at a second person.
+    """
+    header_name = bcba_lba_header_name(fields)
+    if header_name:
+        return header_name
+    m = _search(r"Provider Name:\s*([^\n]+)", fields["full_text"])
+    if not m:
+        return None
+    raw_provider_line = m.group(1).strip()
+    if "bcba" not in raw_provider_line.lower():
+        return None
+    return provider_name(fields)
+
+
 def was_supervised(fields: dict) -> bool | None:
     m = _search(r"Supervised by the BCBA/LBA\?\s*\n?\s*(Yes|No)", fields["full_text"])
     if not m:

@@ -71,7 +71,12 @@ def test_real_path_actually_reaches_the_real_call_site_not_the_mock_stub():
     resolve_judgment_boundary(judge_module, use_real_api=False, confirmed_real=False, mock_fn=_mock_fn)
     resolve_judgment_boundary(judge_module, use_real_api=True, confirmed_real=True, mock_fn=_mock_fn)
 
-    with pytest.raises(RuntimeError, match="BLOCKED by agent-making/agent/tests/conftest.py"):
+    # Fix Round (2026-10-05): real_api_guard.ensure_real_api_calls_allowed()
+    # now fires INSIDE _run_judgment_checks_once, before it ever reaches
+    # anthropic.Anthropic() -- this is now the first guard reached (the
+    # conftest-level anthropic.Anthropic patch below it is still real,
+    # still active, defense-in-depth, just no longer the first one hit).
+    with pytest.raises(RuntimeError, match="BLOCKED by real_api_guard"):
         judge_module._run_judgment_checks_once(
             judgment_rules=[{"rule_id": "R-1", "description": "test rule"}],
             fields={"pages": []}, rendered_images={},

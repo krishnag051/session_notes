@@ -15,6 +15,7 @@ never a raw exception reaching the caller.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import traceback
 from dataclasses import asdict, dataclass, field
@@ -22,6 +23,7 @@ from pathlib import Path
 
 from . import fields as fields_module
 from . import history_comparison as history_comparison_module
+from . import humanize as humanize_module
 from . import integrity as integrity_module
 from . import judge as judge_module
 from . import merge as merge_module
@@ -45,6 +47,59 @@ def classify_batch_pdf(pdf_path: str) -> dict:
     Zero model calls anywhere in this call chain."""
     pages = extract_pdf_text(pdf_path)
     return classify_batch(pages)
+
+
+# Every pipeline module whose code can change a finding's result/evidence
+# text for the SAME input `fields` dict — i.e. everything downstream of
+# extraction that pipeline_version_fingerprint() must cover so a code
+# change here can never be served from a stale cached verdict. Listed
+# explicitly (not "every .py file in this package") so an unrelated change
+# elsewhere (e.g. classify_batch.py, extract.py — covered by the backend's
+# own full_text-based cache key instead, since their output IS full_text)
+# doesn't force every cache entry to invalidate for no real reason.
+_FINGERPRINTED_MODULE_PATHS = [
+    Path(fields_module.__file__),
+    Path(judge_module.__file__),
+    Path(integrity_module.__file__),
+    Path(merge_module.__file__),
+    Path(humanize_module.__file__),
+    Path(history_comparison_module.__file__),
+]
+
+
+def pipeline_version_fingerprint() -> str:
+    """Fix Round (2026-10-05), "non-determinism fix": the backend's own
+    review-result cache (see backend/app/services/review_cache.py) must
+    never serve a verdict computed under an OLD ruleset or OLD rule-
+    checking/prompt code — this is the one function it calls to find out.
+    Returns a sha256 hex digest that changes automatically the moment
+    EITHER of the following changes, with zero manual version-bumping
+    required anywhere, ever:
+
+    - rules.json's raw file bytes (any rule's wording/params/active flag/
+      severity/anything else).
+    - the raw source bytes of every pipeline module in
+      _FINGERPRINTED_MODULE_PATHS above — covers a deterministic-checker
+      wording fix (fields.py), a judgment-prompt change (judge.py), a
+      page-recovery-note reword (integrity.py), a reconciliation-logic
+      change (merge.py), a humanize-prompt change (humanize.py), and a
+      history-comparison-logic change (history_comparison.py). Hashing
+      whole files, not hand-picked constants/functions, deliberately: the
+      failure mode this guards against is a future code change nobody
+      remembers to also reflect in the fingerprint, and a whole-file hash
+      cannot be forgotten to update the way a hand-picked list can.
+
+    Deliberately NOT included: `judge.py`'s model name/call parameters
+    (model_override is a caller-supplied runtime choice, not a pipeline
+    version) — a run under a different model is a genuinely different
+    computation the caller asked for, not a "stale cache" situation, and
+    is out of scope for this round's fix (see this round's own report).
+    """
+    h = hashlib.sha256()
+    h.update(RULES_PATH.read_bytes())
+    for module_path in _FINGERPRINTED_MODULE_PATHS:
+        h.update(module_path.read_bytes())
+    return h.hexdigest()
 
 
 @dataclass
