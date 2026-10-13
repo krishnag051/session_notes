@@ -12,6 +12,7 @@ already closed by then), one commit per document, so partial progress
 survives even if a later document in the batch fails or the process
 restarts mid-batch.
 """
+from pypdf import PdfReader
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -72,6 +73,16 @@ def run_batch_reviews(batch_id: str) -> None:
         ).scalars().all()
         running_total = sum(r.spend_usd for r in already_spent)
 
+        # Fix Round (2026-10-13), "O(n²) batch processing bug": ONE
+        # PdfReader over this batch's own original PDF, opened once here
+        # and shared across every document below — not re-opened/re-parsed
+        # per document (see run_review's own docstring for the real,
+        # measured cost this was costing: 47.75ms per page, over the
+        # WHOLE batch file, repeated per document). Built lazily (only
+        # when there's at least one pending document) so a batch with
+        # nothing left to review never opens the file for no reason.
+        pdf_reader = PdfReader(batch.original_pdf_path) if pending else None
+
         for review, person_document in pending:
             if running_total >= settings.batch_max_spend_usd:
                 # Cap already hit by earlier documents in THIS batch — stop
@@ -84,6 +95,7 @@ def run_batch_reviews(batch_id: str) -> None:
             review = run_review(
                 db, review, person_document, batch,
                 actor=None, model_override=None, raise_on_error=False,
+                shared_pdf_reader=pdf_reader,
             )
             if review.status in ("complete", "cancelled_spend_cap"):
                 running_total += review.spend_usd

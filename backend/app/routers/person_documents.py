@@ -7,6 +7,7 @@ from datetime import date as date_type, datetime
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
+from pypdf import PdfReader
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -62,6 +63,15 @@ class RuleResultOut(BaseModel):
     # own docstring. Surfaced for the CSV export's "raw vs humanized" columns.
     model_finding_raw: str | None
     is_overridden: bool
+    # Fix Round (2026-10-06), "human override" feature: who/when/why an
+    # override happened — these already existed on RuleResult (the PATCH
+    # /rule-results/{id} endpoint already wrote them), but were never
+    # actually surfaced to the review display itself, only is_overridden's
+    # bare boolean. A reviewer needs to SEE who overrode a finding and why,
+    # not just that someone did.
+    overridden_by: str | None
+    overridden_at: datetime | None
+    override_reason: str | None
 
 
 class ReviewOut(BaseModel):
@@ -104,6 +114,7 @@ def _rule_result_out(rr: RuleResult, rules_by_id: dict) -> RuleResultOut:
         final_status=rr.final_status, final_finding=rr.final_finding, final_pages=rr.final_pages,
         model_status=rr.model_status, model_finding_raw=rr.model_finding_raw,
         is_overridden=rr.overridden_by is not None,
+        overridden_by=rr.overridden_by, overridden_at=rr.overridden_at, override_reason=rr.override_reason,
     )
 
 
@@ -218,7 +229,9 @@ def _load_prior_extractions(
     return results or None
 
 
-def _load_sibling_documents(db: Session, batch: SessionNoteBatch, person_document: PersonDocument) -> list[dict] | None:
+def _load_sibling_documents(
+    db: Session, batch: SessionNoteBatch, person_document: PersonDocument, *, reader: PdfReader | None = None,
+) -> list[dict] | None:
     """This SAME person's OTHER documents from the SAME batch/upload (any
     service code), as plain data — for any rule phrased as "at least one
     session note" rather than scoped to a specific assessment/service type
@@ -244,6 +257,13 @@ def _load_sibling_documents(db: Session, batch: SessionNoteBatch, person_documen
     review. `PersonDocument.person_id == person_document.person_id` is the
     fix — sibling lookups must be scoped to the same PATIENT, not just the
     same batch row.
+
+    `reader` (Fix Round 2026-10-13, "O(n²) batch processing bug"): an
+    already-open PdfReader over `batch.original_pdf_path`, shared across
+    every document in one batch run (see run_review's own docstring) —
+    forwarded straight through to slice_pdf_to_temp_file so a sibling
+    lookup never re-opens the whole original batch file on top of
+    whatever run_review's own slice already shares.
     """
     siblings = db.execute(
         select(PersonDocument).where(
@@ -258,7 +278,7 @@ def _load_sibling_documents(db: Session, batch: SessionNoteBatch, person_documen
         return None
     result = []
     for sibling in siblings:
-        sib_path = slice_pdf_to_temp_file(batch.original_pdf_path, sibling.page_start, sibling.page_end)
+        sib_path = slice_pdf_to_temp_file(batch.original_pdf_path, sibling.page_start, sibling.page_end, reader=reader)
         try:
             result.append({"service_code": sibling.service_code, "full_text": extract_pdf_full_text(sib_path)})
         finally:
@@ -276,6 +296,7 @@ def run_review(
     model_override: str | None = None,
     raise_on_error: bool = True,
     force_rerun: bool = False,
+    shared_pdf_reader: PdfReader | None = None,
 ) -> SessionNoteReview:
     """Runs the real pipeline for an EXISTING (already flushed) review row —
     the one place both the manual re-run endpoint below and the automatic
@@ -321,12 +342,32 @@ def run_review(
     merits" action); the real run that follows still WRITES its fresh
     result into the cache afterward, becoming the new cached answer for
     future automatic lookups of this same (cache_key, pipeline_version).
+
+    `shared_pdf_reader` (Fix Round 2026-10-13, "O(n²) batch processing
+    bug"): REAL BUG FOUND AND FIXED — every document in a batch used to
+    re-open and re-parse the WHOLE original batch PDF from disk multiple
+    times each (this function's own slice, the sibling-document slice,
+    and the Activity Statement read all did this independently), with no
+    reuse across documents. For an n-document batch, that's work
+    proportional to n times the batch's OWN page count, which itself
+    grows with n — a real, measured O(n²) (confirmed: 47.75ms per page of
+    real pypdf text extraction alone), and the actual blocker on
+    supporting any batch beyond roughly 50-75 documents, not a cost or
+    storage limit. `run_batch_reviews` now opens ONE PdfReader per batch
+    run and passes it here for every document; `None` (the manual re-run
+    endpoint, which has no batch to share across) falls back to opening
+    one locally, same as before this round, with no change to what any
+    document's own review actually produces — this is a performance fix
+    only, the real PDF content read is identical either way.
     """
     review.status = "processing"
     db.commit()
 
-    sibling_documents = _load_sibling_documents(db, batch, person_document)
-    sliced_path = slice_pdf_to_temp_file(batch.original_pdf_path, person_document.page_start, person_document.page_end)
+    pdf_reader = shared_pdf_reader if shared_pdf_reader is not None else PdfReader(batch.original_pdf_path)
+    sibling_documents = _load_sibling_documents(db, batch, person_document, reader=pdf_reader)
+    sliced_path = slice_pdf_to_temp_file(
+        batch.original_pdf_path, person_document.page_start, person_document.page_end, reader=pdf_reader,
+    )
 
     try:
         full_text = extract_pdf_full_text(sliced_path)
@@ -365,7 +406,7 @@ def run_review(
         # document with a DIFFERENT timesheet row attached is a genuinely
         # different review, so it must be part of "same document").
         timesheet_rows = (
-            extract_activity_statement_rows(batch.original_pdf_path, person_document.activity_statement_page)
+            extract_activity_statement_rows(batch.original_pdf_path, person_document.activity_statement_page, reader=pdf_reader)
             if person_document.activity_statement_page is not None
             else None
         )

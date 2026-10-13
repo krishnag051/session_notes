@@ -1,5 +1,5 @@
 import { createFileRoute, Link, useRouter } from "@tanstack/react-router";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import {
   ArrowLeft,
   FileText,
@@ -18,6 +18,8 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { PdfViewer, type PdfViewerHandle } from "@/components/PdfViewer";
 import { AuditActionsMenu } from "@/components/AuditActionsMenu";
@@ -31,12 +33,15 @@ import {
   listReviewers,
   markReviewed,
   markUnreviewed,
+  overrideRuleResult,
   personDocumentActivityStatementPdfUrl,
   personDocumentPdfUrl,
   type PersonDocumentSummary,
   type Reviewer,
   type RuleResultRow,
 } from "@/lib/api";
+
+const OVERRIDE_STATUS_OPTIONS = ["pass", "fail", "uncertain", "not_applicable", "not_checkable"] as const;
 
 export const Route = createFileRoute("/audits/$auditId/")({
   loader: async ({ params }) => {
@@ -239,10 +244,14 @@ function FindingsPanel({
   groupedResults,
   onGoToPage,
   emptyMessage,
+  onOverridden,
+  defaultActor,
 }: {
   groupedResults: Record<Group, RuleResultRow[]>;
   onGoToPage: (page: number) => void;
   emptyMessage?: string | undefined;
+  onOverridden: () => void;
+  defaultActor: string;
 }) {
   const groupsWithItems = GROUPS.filter((g) => (groupedResults[g] ?? []).length > 0);
   // Failed starts expanded (what a reviewer needs to see first); the rest
@@ -300,7 +309,14 @@ function FindingsPanel({
                 <AccordionContent>
                   <ul className="space-y-2">
                     {items.map((r) => (
-                      <RuleRow key={r.id} rule={r} chipClass={style.chip} onGoToPage={onGoToPage} />
+                      <RuleRow
+                        key={r.id}
+                        rule={r}
+                        chipClass={style.chip}
+                        onGoToPage={onGoToPage}
+                        onOverridden={onOverridden}
+                        defaultActor={defaultActor}
+                      />
                     ))}
                   </ul>
                 </AccordionContent>
@@ -529,6 +545,8 @@ function AuditDetail() {
                 ? `No compliance rules apply to this document type (${review.service_code ?? "this code"}) yet.`
                 : undefined
             }
+            onOverridden={() => router.invalidate()}
+            defaultActor={reviewerName}
           />
         </div>
       </div>
@@ -574,14 +592,60 @@ function RuleRow({
   rule,
   chipClass,
   onGoToPage,
+  onOverridden,
+  defaultActor,
 }: {
   rule: RuleResultRow;
   chipClass: string;
   onGoToPage: (page: number) => void;
+  onOverridden: () => void;
+  defaultActor: string;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [status, setStatus] = useState(rule.final_status);
+  const [finding, setFinding] = useState(rule.final_finding ?? "");
+  const [actor, setActor] = useState(defaultActor);
+  const [reason, setReasonText] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const pages = normalizePages(rule.final_pages);
-  const reason = findingReason(rule.final_status, rule.final_finding);
+  const findingReasonText = findingReason(rule.final_status, rule.final_finding);
+
+  function startEditing(e: MouseEvent) {
+    e.stopPropagation();
+    setStatus(rule.final_status);
+    setFinding(rule.final_finding ?? "");
+    setActor(defaultActor);
+    setReasonText("");
+    setSaveError(null);
+    setEditing(true);
+    setExpanded(true);
+  }
+
+  async function handleSaveOverride(e: MouseEvent) {
+    e.stopPropagation();
+    if (!actor.trim() || !reason.trim()) {
+      setSaveError("A reviewer name and a reason are both required.");
+      return;
+    }
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await overrideRuleResult(rule.id, {
+        final_status: status,
+        final_finding: finding,
+        override_reason: reason.trim(),
+        actor: actor.trim(),
+      });
+      setEditing(false);
+      onOverridden(); // re-fetches the whole review — the PATCH response is its own narrower shape, not a full RuleResultRow
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : "Override failed to save.");
+    } finally {
+      setSaving(false);
+    }
+  }
 
   return (
     <li
@@ -618,7 +682,7 @@ function RuleRow({
                 missing prior note/timesheet) from genuine judge
                 disagreement, since those mean very different things to a
                 reviewer. */}
-            {reason && <div className="mt-0.5 text-xs font-medium text-muted-foreground">{reason}</div>}
+            {findingReasonText && <div className="mt-0.5 text-xs font-medium text-muted-foreground">{findingReasonText}</div>}
           </div>
         </div>
         <span className={`shrink-0 rounded-md px-2 py-0.5 text-xs font-semibold ${chipClass}`}>
@@ -656,6 +720,74 @@ function RuleRow({
             </div>
           )}
           <p className="mt-1 text-xs text-muted-foreground/70">{rule.rule_id}</p>
+
+          {/* The original AI answer is never lost -- still visible here,
+              whether or not an override has happened, so a reviewer can
+              always compare. */}
+          {(rule.model_status || rule.model_finding_raw) && (
+            <p className="mt-1.5 text-xs text-muted-foreground/70">
+              Original AI answer: <span className="font-medium">{rule.model_status}</span>
+              {rule.model_finding_raw ? ` — ${rule.model_finding_raw}` : ""}
+            </p>
+          )}
+
+          {rule.is_overridden && (
+            <div className="mt-2 rounded-md border border-warning-foreground/30 bg-warning/10 p-2 text-xs">
+              <span className="font-semibold">Overridden</span> by {rule.overridden_by}
+              {rule.overridden_at ? ` on ${rule.overridden_at.slice(0, 10)}` : ""}
+              {rule.override_reason ? ` — reason: ${rule.override_reason}` : ""}
+            </div>
+          )}
+
+          {!editing ? (
+            <Button variant="outline" size="sm" className="mt-2" onClick={startEditing}>
+              {rule.is_overridden ? "Override again" : "Override"}
+            </Button>
+          ) : (
+            <div className="mt-2 flex flex-col gap-2 rounded-md border bg-muted/30 p-2.5" onClick={(e) => e.stopPropagation()}>
+              <div>
+                <label className="text-[11px] font-medium text-muted-foreground">Status</label>
+                <Select value={status} onValueChange={setStatus}>
+                  <SelectTrigger className="h-8 w-44 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {OVERRIDE_STATUS_OPTIONS.map((s) => (
+                      <SelectItem key={s} value={s}>{s}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div>
+                <label className="text-[11px] font-medium text-muted-foreground">Explanation shown to reviewers</label>
+                <Textarea
+                  value={finding}
+                  onChange={(e) => setFinding(e.target.value)}
+                  className="min-h-16 text-sm"
+                  onClick={(e) => e.stopPropagation()}
+                />
+              </div>
+              <div className="flex flex-wrap items-end gap-2">
+                <div>
+                  <label className="text-[11px] font-medium text-muted-foreground">Your name</label>
+                  <Input value={actor} onChange={(e) => setActor(e.target.value)} className="h-8 w-48 text-sm" placeholder="Reviewer name" />
+                </div>
+                <div className="min-w-48 flex-1">
+                  <label className="text-[11px] font-medium text-muted-foreground">Reason for override (required)</label>
+                  <Input value={reason} onChange={(e) => setReasonText(e.target.value)} className="h-8 text-sm" placeholder="Why are you changing this?" />
+                </div>
+              </div>
+              {saveError && <p className="text-xs text-destructive">{saveError}</p>}
+              <div className="flex items-center gap-2">
+                <Button size="sm" onClick={handleSaveOverride} disabled={saving}>
+                  {saving ? "Saving…" : "Save override"}
+                </Button>
+                <Button size="sm" variant="ghost" onClick={(e) => { e.stopPropagation(); setEditing(false); }} disabled={saving}>
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </li>

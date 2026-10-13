@@ -42,8 +42,30 @@ def has_applicable_rules(service_code: str) -> bool:
 
 
 def finding_group(rule_result: RuleResult, rules_by_id: dict[str, dict]) -> str:
-    if rules_by_id.get(rule_result.rule_id, {}).get("type") == "Informational":
-        return "Informational"
+    """REAL BUG FOUND AND FIXED (2026-10-06): a real passing rule
+    (SN-97153-21, "Was this NOT a supervised session?" -- check_type=
+    deterministic, final_status="pass") was showing under "Informational"
+    in the UI instead of "Passed". Root cause: this function used to
+    check rules.json's own `type == "Informational"` FIRST and return
+    "Informational" unconditionally whenever it matched, regardless of
+    the rule's REAL final_status -- conflating two genuinely separate
+    concerns that happened to share the same rules.json flag:
+    (1) "exclude this rule from the pass/fail SCORE" (compute_score's own,
+        legitimate, UNCHANGED use of the same `type == "Informational"`
+        flag below -- a gate/flag question is never a scored compliance
+        question, and that exclusion is correct and untouched here), vs.
+    (2) "which DISPLAY BUCKET does a real verdict belong in" -- which
+        must be driven by the rule's own ACTUAL classification
+        (final_status), never by an unrelated metadata flag.
+    Scope checked directly against the real rules.json: SN-97153-21 is
+    the ONLY rule with type=="Informational" today, so no OTHER document
+    was silently mis-bucketed by this same mechanism -- but the mechanism
+    itself was wrong in principle and would have silently mis-bucketed
+    any FUTURE Informational-type rule's real pass/fail the same way.
+    Bucketing is now driven by classification alone, full stop -- the
+    pre-seeded "Informational" group in _build_grouped_results simply
+    stays empty unless something else populates it in the future.
+    """
     return _RESULT_TO_GROUP.get(rule_result.final_status, "Failed")
 
 

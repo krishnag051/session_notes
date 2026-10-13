@@ -89,14 +89,20 @@ def test_review_document_mocked_writes_review_and_rule_results(client, monkeypat
     resp = client.post(f"/api/person-documents/{doc['id']}/review", json={"actor": "k.kumar@masterfaster.org"})
     assert resp.status_code == 201, resp.text
     body = resp.json()
-    assert body["score"] == 50.0  # 1 pass (16) + 1 fail (06) among scored findings -- 04 not_checkable and 21 Informational excluded
+    assert body["score"] == 50.0  # 1 pass (16) + 1 fail (06) among scored findings -- 04 not_checkable and 21 Informational-type excluded FROM SCORE (unchanged)
     assert body["audit_result"] == "fail"  # 50% is below the 80% default threshold
     assert body["reviewed"] is False  # review status is a SEPARATE axis, untouched by this endpoint
     assert body["api_calls_used"] == 2
     assert len(body["grouped_results"]["Failed"]) == 1
     assert len(body["grouped_results"]["Not Applicable"]) == 1
-    assert len(body["grouped_results"]["Informational"]) == 1
-    assert len(body["grouped_results"]["Passed"]) == 1
+    # REAL BUG FOUND AND FIXED (2026-10-06): SN-97153-21's own real
+    # final_status="pass" used to be forced into "Informational" by its
+    # rules.json type flag, regardless of its real verdict -- display
+    # grouping is now driven by classification alone (see finding_group's
+    # own docstring); "Informational" stays empty here, and BOTH real
+    # passes (16 and 21) land in "Passed".
+    assert len(body["grouped_results"]["Informational"]) == 0
+    assert len(body["grouped_results"]["Passed"]) == 2
 
 
 def test_review_document_all_pass_rolls_up_to_pass(client, monkeypatch):
@@ -339,6 +345,48 @@ def test_override_rule_result_sets_final_never_model(client, monkeypatch):
     assert same_rule["is_overridden"] is True
     # Overriding the one Failed rule to pass should flip the whole review's audit_result too.
     assert review_after["audit_result"] == "pass"
+
+
+def test_override_rule_result_who_when_why_are_visible_on_the_reviewed_display(client, monkeypatch):
+    """Fix Round (2026-10-06), "human override" feature: the override
+    endpoint already wrote overridden_by/overridden_at/override_reason to
+    the database, but the review DISPLAY endpoint (what a later viewer
+    actually sees) never surfaced them -- only the bare is_overridden
+    boolean. A reviewer needs to see WHO overrode a finding and WHY, not
+    just that someone did, and the ORIGINAL AI finding text must still be
+    visible for comparison, never silently replaced.
+    """
+    batch = _upload_batch(client, "batch_19page_3client.pdf")
+    doc = next(d for d in batch["documents"] if d["service_code"] == "97153")
+    monkeypatch.setattr(person_documents_module, "review_person_document", lambda *a, **k: _FakeResult(_fake_findings()))
+    review = client.post(f"/api/person-documents/{doc['id']}/review", json={}).json()
+
+    failed_rule = review["grouped_results"]["Failed"][0]
+    original_model_finding_raw = failed_rule["model_finding_raw"]
+
+    resp = client.patch(
+        f"/api/rule-results/{failed_rule['id']}",
+        json={
+            "final_status": "pass", "final_finding": "Reviewer confirmed this is fine.",
+            "override_reason": "checked manually against page 4", "actor": "k.kumar@masterfaster.org",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    review_after = client.get(f"/api/person-documents/{doc['id']}/review").json()
+    same_rule = next(r for r in review_after["grouped_results"]["Passed"] if r["id"] == failed_rule["id"])
+
+    # Who, when, why -- all now visible on the DISPLAY endpoint, not just
+    # buried in the PATCH response nobody re-reads later.
+    assert same_rule["overridden_by"] == "k.kumar@masterfaster.org"
+    assert same_rule["overridden_at"] is not None
+    assert same_rule["override_reason"] == "checked manually against page 4"
+    # The overridden value is what a later viewer sees...
+    assert same_rule["final_status"] == "pass"
+    assert same_rule["final_finding"] == "Reviewer confirmed this is fine."
+    # ...but the original AI answer is still fully recoverable, never lost.
+    assert same_rule["model_status"] == "fail"
+    assert same_rule["model_finding_raw"] == original_model_finding_raw
 
 
 def test_override_rule_result_404_for_unknown_id(client):

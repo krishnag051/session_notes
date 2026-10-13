@@ -20,6 +20,31 @@ import { listAudits, type AuditListResult, type AuditRow } from "@/lib/api";
 
 const PAGE_SIZE = 15;
 
+// Purely a visual grouping aid -- every row from the same upload (batch_id)
+// shares one tint, cycling through this set in order as batch_id changes
+// down the (already upload-time-sorted) list. Kept deliberately away from
+// the existing success(green)/warning(amber)/destructive(red) semantic
+// palette already used by the status badges in this same table, so a tint
+// is never mistaken for a status signal. Light-mode tint + a low-opacity
+// dark-mode counterpart for each, since this app supports both.
+const BATCH_TINT_CLASSES = [
+  "bg-blue-50 dark:bg-blue-950/30",
+  "bg-violet-50 dark:bg-violet-950/30",
+  "bg-cyan-50 dark:bg-cyan-950/30",
+  "bg-indigo-50 dark:bg-indigo-950/30",
+];
+
+function formatUploadTime(iso: string): string {
+  // "short" date style (e.g. "10/13/26, 4:32 PM") -- compact enough to
+  // fit this column without truncating, while still a clear, absolute
+  // timestamp (never a relative "2 hours ago" style, since exact time
+  // matters for a compliance tool).
+  return new Date(iso).toLocaleString(undefined, {
+    dateStyle: "short",
+    timeStyle: "short",
+  });
+}
+
 function AuditFlagsBadge({ row }: { row: AuditRow }) {
   if (row.processing_status === "pending" || row.processing_status === "processing") {
     return (
@@ -153,6 +178,23 @@ function AuditsList() {
 
   const totalPages = Math.max(1, Math.ceil(result.total / PAGE_SIZE));
 
+  // One tint per upload, cycling as batch_id changes walking down the
+  // list (which is already sorted newest-upload-first by the backend) --
+  // every row sharing a batch_id gets the same tint as the row above it.
+  const rowTints = useMemo(() => {
+    const tints = new Map<string, string>();
+    let lastBatchId: string | null = null;
+    let colorIndex = -1;
+    for (const row of result.items) {
+      if (row.batch_id !== lastBatchId) {
+        colorIndex = (colorIndex + 1) % BATCH_TINT_CLASSES.length;
+        lastBatchId = row.batch_id;
+      }
+      tints.set(row.person_document_id, BATCH_TINT_CLASSES[colorIndex] ?? BATCH_TINT_CLASSES[0]!);
+    }
+    return tints;
+  }, [result.items]);
+
   return (
     <div>
       <PageHeader title="Audits" subtitle="All processed patient documents, most recently uploaded first." />
@@ -213,55 +255,64 @@ function AuditsList() {
           </div>
 
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="w-full table-fixed text-sm">
               <thead>
                 <tr className="border-b text-left text-xs uppercase tracking-wide text-muted-foreground">
-                  <th className="px-5 py-3 font-medium">Client</th>
-                  <th className="px-5 py-3 font-medium">Code</th>
-                  <th className="px-5 py-3 font-medium">Date of service</th>
-                  <th className="px-5 py-3 font-medium">Provider</th>
-                  <th className="px-5 py-3 font-medium">BCBA</th>
-                  <th className="px-5 py-3 font-medium">Start time</th>
-                  <th className="px-5 py-3 font-medium">End time</th>
-                  <th className="px-5 py-3 font-medium">Score</th>
-                  <th className="px-5 py-3 font-medium">Reviewed by</th>
-                  <th className="px-5 py-3 font-medium">Review status</th>
-                  <th className="px-5 py-3 font-medium">Audit flags</th>
-                  <th className="px-5 py-3 font-medium"></th>
-                  <th className="px-5 py-3 font-medium"></th>
+                  <th className="w-[13%] px-5 py-3 font-medium">Upload time</th>
+                  <th className="w-[11%] px-5 py-3 font-medium">Client</th>
+                  <th className="w-[6%] px-3 py-3 font-medium">Code</th>
+                  <th className="w-[8%] px-3 py-3 font-medium">Date of service</th>
+                  <th className="w-[9%] px-5 py-3 font-medium">Provider</th>
+                  <th className="w-[9%] px-5 py-3 font-medium">BCBA</th>
+                  <th className="w-[7%] px-3 py-3 font-medium">Start time</th>
+                  <th className="w-[7%] px-3 py-3 font-medium">End time</th>
+                  <th className="w-[5%] px-3 py-3 font-medium">Score</th>
+                  <th className="w-[6%] px-5 py-3 font-medium">Reviewed by</th>
+                  <th className="w-[6%] px-3 py-3 font-medium">Review status</th>
+                  <th className="w-[6%] px-3 py-3 font-medium">Audit flags</th>
+                  <th className="w-[3%] px-3 py-3 font-medium"></th>
+                  <th className="w-[3%] px-2 py-3 font-medium"></th>
                 </tr>
               </thead>
               <tbody>
                 {result.items.map((a) => (
                   <tr
                     key={a.person_document_id}
-                    className={`border-b last:border-0 hover:bg-muted/50 ${!a.active ? "opacity-50" : ""}`}
+                    className={`border-b last:border-0 hover:bg-muted/50 ${rowTints.get(a.person_document_id) ?? ""} ${!a.active ? "opacity-50" : ""}`}
                   >
+                    <td className="truncate px-5 py-3 text-muted-foreground" title={formatUploadTime(a.uploaded_at)}>
+                      {formatUploadTime(a.uploaded_at)}
+                    </td>
                     <td className="px-5 py-3 font-medium">
                       <Link
                         to="/audits/$auditId"
                         params={{ auditId: a.person_document_id }}
-                        className="hover:text-primary hover:underline"
+                        className="truncate hover:text-primary hover:underline"
+                        title={a.client ?? "Unresolved"}
                       >
                         {a.client ?? "Unresolved"}
                       </Link>
                       {!a.active && <Badge variant="secondary" className="ml-2 bg-muted text-muted-foreground">Archived</Badge>}
                     </td>
-                    <td className="px-5 py-3 text-muted-foreground">{a.code}</td>
-                    <td className="px-5 py-3 text-muted-foreground">{a.date_of_service}</td>
-                    <td className="px-5 py-3 text-muted-foreground">{a.provider ?? "—"}</td>
-                    <td className="px-5 py-3 text-muted-foreground">{a.bcba ?? "—"}</td>
-                    <td className="px-5 py-3 text-muted-foreground">{a.start_time ?? "—"}</td>
-                    <td className="px-5 py-3 text-muted-foreground">{a.end_time ?? "—"}</td>
-                    <td className="px-5 py-3 font-medium">{a.score !== null ? `${a.score}%` : "—"}</td>
-                    <td className="px-5 py-3 text-muted-foreground">{a.reviewed_by ?? "—"}</td>
-                    <td className="px-5 py-3">
+                    {/* Code/Date of service/Start/End time/Score are short,
+                        EXACT compliance values -- never truncated with an
+                        ellipsis, unlike the free-text name columns above/
+                        below, which can legitimately run long. */}
+                    <td className="px-3 py-3 text-muted-foreground">{a.code}</td>
+                    <td className="px-3 py-3 whitespace-nowrap text-muted-foreground">{a.date_of_service}</td>
+                    <td className="truncate px-5 py-3 text-muted-foreground" title={a.provider ?? undefined}>{a.provider ?? "—"}</td>
+                    <td className="truncate px-5 py-3 text-muted-foreground" title={a.bcba ?? undefined}>{a.bcba ?? "—"}</td>
+                    <td className="px-3 py-3 whitespace-nowrap text-muted-foreground">{a.start_time ?? "—"}</td>
+                    <td className="px-3 py-3 whitespace-nowrap text-muted-foreground">{a.end_time ?? "—"}</td>
+                    <td className="px-3 py-3 font-medium">{a.score !== null ? `${a.score}%` : "—"}</td>
+                    <td className="truncate px-5 py-3 text-muted-foreground" title={a.reviewed_by ?? undefined}>{a.reviewed_by ?? "—"}</td>
+                    <td className="px-3 py-3">
                       <ReviewStatusBadge status={a.review_status} />
                     </td>
-                    <td className="px-5 py-3">
+                    <td className="px-3 py-3">
                       <AuditFlagsBadge row={a} />
                     </td>
-                    <td className="px-5 py-3 text-right">
+                    <td className="px-3 py-3 text-right">
                       <Button asChild size="sm" variant="outline">
                         <Link to="/audits/$auditId" params={{ auditId: a.person_document_id }}>
                           View
@@ -280,7 +331,7 @@ function AuditsList() {
                 ))}
                 {result.items.length === 0 && (
                   <tr>
-                    <td colSpan={13} className="px-5 py-12 text-center text-muted-foreground">
+                    <td colSpan={14} className="px-5 py-12 text-center text-muted-foreground">
                       {loading ? "Loading…" : "No audits match these filters."}
                     </td>
                   </tr>

@@ -10,6 +10,7 @@ import { useEffect } from "react";
 
 import { reportLovableError } from "../lib/lovable-error-reporting";
 import { AppSidebar } from "@/components/AppSidebar";
+import { DemoLoginGate } from "@/components/DemoLoginGate";
 import { Toaster } from "@/components/ui/sonner";
 
 
@@ -95,16 +96,30 @@ function RootComponent() {
   return (
     <QueryClientProvider client={queryClient}>
       <HeadContent />
-      <div className="min-h-screen bg-background">
-        <AppSidebar />
-        <main className="md:pl-64">
-          <div className="mx-auto max-w-7xl px-6 py-8">
-            {/* Required: nested routes render here. Removing <Outlet /> breaks all child routes. */}
-            <Outlet />
-          </div>
-        </main>
-        <Toaster />
-      </div>
+      {/* Demo-only screen lock (frontend-only, no backend enforcement) —
+          see DemoLoginGate.tsx's own top comment. Gates EVERYTHING below,
+          including the sidebar, until the hardcoded demo credentials are
+          entered once (persisted in localStorage across browser restarts). */}
+      <DemoLoginGate>
+        <div className="min-h-screen bg-background">
+          <AppSidebar />
+          <main className="md:pl-64">
+            {/* Widened from max-w-7xl (1280px) -- the Audits table (14
+                columns once Upload Time is added) was leaving real,
+                visible unused space on both sides at the old width. This
+                is a global change (every page shares this one wrapper),
+                not an Audits-only override -- deliberate, since a wider
+                content area only ever gives a data-dense admin tool more
+                room, and no other page here has fixed-width content that
+                would look wrong with extra side margin reclaimed. */}
+            <div className="mx-auto max-w-[1600px] px-4 py-8">
+              {/* Required: nested routes render here. Removing <Outlet /> breaks all child routes. */}
+              <Outlet />
+            </div>
+          </main>
+          <Toaster />
+        </div>
+      </DemoLoginGate>
     </QueryClientProvider>
   );
 }

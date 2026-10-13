@@ -63,6 +63,13 @@ def audit_summary(db: Session = Depends(get_db)) -> AuditSummaryOut:
 
 class AuditRowOut(BaseModel):
     person_document_id: str
+    batch_id: str
+    # The batch's own REAL upload timestamp (SessionNoteBatch.uploaded_at)
+    # — not approximated from date_of_service or created_at on some other
+    # row. Also the actual primary sort key below, and what the frontend
+    # uses to group consecutive rows from the same upload for its own
+    # per-batch row tinting.
+    uploaded_at: datetime
     client: str | None
     code: str | None
     date_of_service: date | None
@@ -179,9 +186,11 @@ def list_audits(
     ).all()
 
     items = []
-    for doc, person, review, _batch in rows:
+    for doc, person, review, batch in rows:
         items.append(AuditRowOut(
             person_document_id=doc.id,
+            batch_id=batch.id,
+            uploaded_at=batch.uploaded_at,
             client=person.full_name if person else None,
             code=doc.service_code,
             date_of_service=doc.date_of_service,
