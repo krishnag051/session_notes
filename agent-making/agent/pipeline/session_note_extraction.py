@@ -10,12 +10,25 @@ Same honest-confidence philosophy as supporting_doc_extraction.py: a field
 that isn't actually in the document comes back confidence="none",
 value=None -- never a guess, never silently blank without saying so.
 
-Model call goes through pipeline/model_provider.py's call_tool_json --
-defaults to the free OpenRouter model for building/testing (see that
-module's own docstring for exactly why), never Anthropic unless a human
-explicitly passes model_override="anthropic:..." with separate per-
-instance approval, same standing rule as every other real Anthropic call
-site in this pipeline.
+REMOVED the free OpenRouter/Nemotron default (2026-10-15): this call site
+used to fall through to call_tool_json's generic model_override=None
+default (the free OpenRouter model meant for building/testing -- see that
+module's own docstring), and nothing in docker-compose.yml/docker-compose.
+staging.yml ever overrode it -- so every real production/staging document
+review was silently making this one real call against a free-tier,
+rate-limited model. REAL INCIDENT (2026-10-15): a live 184-document batch
+was observed crawling, with logs showing repeated free-tier rate-limit
+retries on exactly this call ('session_note_extraction'). This was never a
+deliberate, scoped cost-saving choice for the real pipeline -- it was
+model_provider.py's dev/test default, wired into the real review path
+without ever being overridden for it.
+
+Now defaults to a real, billed Anthropic call (model_provider.
+SESSION_NOTE_EXTRACTION_MODEL, i.e. claude-haiku-5-5 -- $0.10/$0.50 per
+MTok, confirmed directly against platform.claude.com's live pricing the
+same round this was fixed) UNLESS a caller explicitly passes its own
+model_override (e.g. a test deliberately exercising a different model/
+provider) -- see extract_session_note_text's own docstring below.
 
 Local caching only (Round 59) -- NOT a database table. Keyed by a SHA-256
 content hash of the file's own bytes, so re-processing the identical file
@@ -37,7 +50,7 @@ from pathlib import Path
 from typing import Any
 
 from .extract import extract_pdf_text
-from .model_provider import CallTracker, ModelCallError, call_tool_json
+from .model_provider import SESSION_NOTE_EXTRACTION_MODEL, CallTracker, ModelCallError, call_tool_json
 
 # Live incident fix (2026-08): a session-note file whose extraction hit a
 # CONFIRMED-TRANSIENT upstream failure (model_provider.py's own retry loop
@@ -222,9 +235,20 @@ def extract_session_note_text(
     still reaches this except clause means BOTH OpenRouter (with retries)
     AND the Anthropic fallback were exhausted -- a stronger, not weaker,
     failure signal than before this fix, and still exactly the case this
-    honest-failure-marker behavior exists for.
+    honest-failure-marker behavior exists for. (This OpenRouter-then-
+    Anthropic-fallback path is no longer the live one by default -- see
+    the fix directly below -- but is left in place for a caller that
+    explicitly passes an "openrouter" model_override on purpose.)
+
+    REAL FIX (2026-10-15): `model_override=None` here no longer means
+    "let call_tool_json fall through to its own generic default" (the
+    free OpenRouter model) -- it now means "use this call site's own real
+    default", SESSION_NOTE_EXTRACTION_MODEL (claude-haiku-5-5), called
+    directly against Anthropic. An explicit caller-supplied model_override
+    (e.g. a test exercising a different model) is still honored as-is.
     """
     prompt = _build_prompt(full_text)
+    resolved_model_override = model_override or f"anthropic:{SESSION_NOTE_EXTRACTION_MODEL}"
     try:
         raw = call_tool_json(
             prompt_text=prompt,
@@ -232,7 +256,7 @@ def extract_session_note_text(
             tool_description=EXTRACTION_TOOL_DESCRIPTION,
             input_schema=EXTRACTION_INPUT_SCHEMA,
             tracker=tracker,
-            model_override=model_override,
+            model_override=resolved_model_override,
             call_reason="session_note_extraction",
         )
     except ModelCallError as exc:

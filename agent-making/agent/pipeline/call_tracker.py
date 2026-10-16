@@ -17,15 +17,35 @@ import os
 INPUT_COST_PER_MTOK = 2.00
 OUTPUT_COST_PER_MTOK = 10.00
 
-# claude-haiku-4-5 (model_provider.py's ANTHROPIC_FALLBACK_MODEL) — a
-# DIFFERENT, cheaper rate card from Sonnet above; using the Sonnet
-# constants for a Haiku call would overstate its real cost. FLAG: this is
-# a best-available published-rate estimate, not independently re-verified
-# against Anthropic's live pricing page this round — confirm before
-# treating it as gospel for a real budget decision, same caveat as the
-# Sonnet numbers above.
+# claude-haiku-4-5 pricing. NOT used by any real call site as of
+# 2026-10-15 — model_provider.py's ANTHROPIC_FALLBACK_MODEL (its only
+# real caller) switched to claude-haiku-5-5 that round, per Krishna's own
+# blanket "every Haiku 4.5 call site moves to 5.5" instruction. Kept here
+# (not deleted) only because agent-making's own tests exercise the
+# generic CallTracker pricing mechanism against this literal model
+# string/rate as a stand-in example, not because anything live still
+# prices a real call this way. Confirmed accurate against platform.
+# claude.com/docs/en/about-claude/pricing at the time it was added:
+# $1/$5 per MTok for Claude Haiku 4.5 — left as a historical reference
+# rate, not a live one.
 HAIKU_INPUT_COST_PER_MTOK = 1.00
 HAIKU_OUTPUT_COST_PER_MTOK = 5.00
+
+# claude-haiku-5-5 — the real, live rate for every real Haiku call site in
+# this pipeline as of 2026-10-15 (model_provider.py's
+# CLASSIFICATION_FALLBACK_MODEL, SESSION_NOTE_EXTRACTION_MODEL, and
+# ANTHROPIC_FALLBACK_MODEL; humanize.py's REWRITE_MODEL). Do not reuse
+# HAIKU_INPUT_COST_PER_MTOK/HAIKU_OUTPUT_COST_PER_MTOK above for any of
+# these, they price a different, no-longer-used real model (4.5, not 5.5)
+# at a 10x higher real rate. Confirmed directly against platform.
+# claude.com/docs/en/about-claude/pricing: Claude Haiku 5.5 is $0.10
+# input / $0.50 output per MTok for prompts up to 100,000 tokens (the
+# only tier any of these call sites ever uses — none of their own prompts
+# approach that size; the >100k tier, $0.50/$2.50, is listed on the live
+# page but deliberately not used here since nothing in this pipeline
+# could ever reach it).
+HAIKU_5_5_INPUT_COST_PER_MTOK = 0.10
+HAIKU_5_5_OUTPUT_COST_PER_MTOK = 0.50
 
 # Never silently absent — read once with an explicit default (4.00) rather
 # than "if set" logic that could leave the cap undefined.

@@ -157,12 +157,31 @@ def _humanize_segment(text: str) -> str:
 # Next Round (2026-08-27), Part 1: the real LLM rewrite, approved with an
 # explicit $4 hard cap for this whole round including testing.
 #
-# Model choice: claude-haiku-4-5 -- this repo's own already-established
-# cheap/fast real-Anthropic model (see model_provider.py's
-# ANTHROPIC_FALLBACK_MODEL, same model, same reasoning: "a fallback whose
-# whole point is get a real answer anyway shouldn't itself become the
-# slow/expensive path" -- a short rewrite task is the same shape of
-# problem). Real, current pricing: $1.00/Mtok input, $5.00/Mtok output.
+# Model choice: claude-haiku-5-5 (switched 2026-10-15 from claude-haiku-
+# 4-5 -- Krishna's explicit, blanket instruction that round: every real
+# Haiku 4.5 call site in this project moves to 5.5) -- this repo's own
+# already-established cheap/fast real-Anthropic model (see model_
+# provider.py's ANTHROPIC_FALLBACK_MODEL, same model, same reasoning: "a
+# fallback whose whole point is get a real answer anyway shouldn't itself
+# become the slow/expensive path" -- a short rewrite task is the same
+# shape of problem). Real, current pricing: $0.10/Mtok input, $0.50/Mtok
+# output (confirmed live against platform.claude.com's own pricing page,
+# same as the other two Haiku 5.5 call sites already added).
+#
+# FLAG, honestly, not glossed over: this specific task -- rewriting
+# review findings into final, human-readable output, including the exact
+# [Page N] placeholder-preservation behavior the real incident right
+# below this comment block was caught and fixed for -- has NOT been
+# re-verified against 5.5 specifically. It's the same real model FAMILY
+# and the same cheap/fast tier Anthropic positions 5.5 as a strict
+# upgrade over 4.5 for, so there's no specific reason to expect a
+# regression -- but "no specific reason to expect one" is not the same
+# claim as "confirmed, tested fine on this exact task." The placeholder-
+# preservation behavior in particular is worth a real, cheap spot-check
+# against 5.5 before trusting it blindly on a live review the same way
+# 4.5's own behavior was (see the real, cost-under-a-tenth-of-a-cent test
+# documented immediately below, run specifically because an untested
+# assumption about placeholder handling was wrong once already).
 #
 # This is a SECOND pass, layered ON TOP of the free, deterministic
 # humanize_evidence above -- never a replacement. Order matters: the
@@ -178,22 +197,28 @@ def _humanize_segment(text: str) -> str:
 # rephrase, drop, or renumber a tag even if it tried.
 import anthropic
 
+from .call_tracker import HAIKU_5_5_INPUT_COST_PER_MTOK, HAIKU_5_5_OUTPUT_COST_PER_MTOK
 from .real_api_guard import ensure_real_api_calls_allowed
 
-REWRITE_MODEL = "claude-haiku-4-5"
-_INPUT_COST_PER_MTOK = 1.00
-_OUTPUT_COST_PER_MTOK = 5.00
+REWRITE_MODEL = "claude-haiku-5-5"
 
 # REDESIGNED after a real, caught-cheap test run: an earlier version of
 # this used exotic private-use Unicode characters (e.g. "\ue0000\ue001")
-# as placeholders. Real result against claude-haiku-4-5: it did NOT copy
-# them through -- it "explained" them as if they were meaningful content
-# ("in location 0", "location 1 came up empty"), silently destroying the
-# real page reference. Confirmed by literally running it (cost: under a
-# tenth of a cent) before committing to this design, not assumed. Switched
-# to a plain, unmistakable ASCII token instead -- a small, cheap model is
-# far more likely to recognize "keep PAGEREF0 exactly as-is" as a literal
-# copy instruction than to treat oddball Unicode as something to describe.
+# as placeholders. Real result against claude-haiku-4-5 (the model this
+# ran on at the time -- NOT re-verified against claude-haiku-5-5 since
+# the 2026-10-15 model switch above, flagged honestly rather than assumed
+# to still hold): it did NOT copy them through -- it "explained" them as
+# if they were meaningful content ("in location 0", "location 1 came up
+# empty"), silently destroying the real page reference. Confirmed by
+# literally running it (cost: under a tenth of a cent) before committing
+# to this design, not assumed. Switched to a plain, unmistakable ASCII
+# token instead -- a small, cheap model is far more likely to recognize
+# "keep PAGEREF0 exactly as-is" as a literal copy instruction than to
+# treat oddball Unicode as something to describe. The ASCII-token design
+# itself is model-agnostic and has no specific reason to behave
+# differently on 5.5, but the PAGEREF-restoration safety net a few rules
+# below (triggered by a separate real 4.5-era bug) is what actually
+# protects a live review either way, model swap or not.
 # Fix Round (2026-08-27): REAL BUG FOUND AND FIXED, confirmed via a real
 # completed review (30 of 181 findings across a wide, unrelated spread of
 # rule_ids showed raw, un-restored "PAGEREF0PAGEREF1PAGEREF2"-style tokens
@@ -407,17 +432,22 @@ def humanize_evidence_with_llm(
 
     input_tokens = getattr(response.usage, "input_tokens", 0)
     output_tokens = getattr(response.usage, "output_tokens", 0)
-    cost_usd = (input_tokens / 1_000_000) * _INPUT_COST_PER_MTOK + (output_tokens / 1_000_000) * _OUTPUT_COST_PER_MTOK
+    cost_usd = (
+        (input_tokens / 1_000_000) * HAIKU_5_5_INPUT_COST_PER_MTOK
+        + (output_tokens / 1_000_000) * HAIKU_5_5_OUTPUT_COST_PER_MTOK
+    )
     usage = {
         "input_tokens": input_tokens, "output_tokens": output_tokens, "cost_usd": cost_usd,
         "pre_humanize_text": cleaned,
     }
     if tracker is not None:
-        # "anthropic-fallback" -- the SAME provider key model_provider.py's
-        # own CallTracker already prices at claude-haiku-4-5's real rate
-        # ($1.00/$5.00 per Mtok), never Sonnet's -- REWRITE_MODEL IS
-        # claude-haiku-4-5, so this is the correct, not an approximate,
-        # rate for this call.
+        # model_provider.py's own CallTracker prices by real MODEL string,
+        # not provider label (see that class's own docstring for the real
+        # mispricing bug this guards against) -- REWRITE_MODEL is
+        # claude-haiku-5-5, which _PRICING_BY_MODEL there maps to
+        # HAIKU_5_5_INPUT_COST_PER_MTOK/HAIKU_5_5_OUTPUT_COST_PER_MTOK, the
+        # correct real rate for this call, not Sonnet's and not 4.5's old
+        # rate.
         tracker.record(
             reason="humanize_evidence_with_llm", provider="anthropic-fallback", model=REWRITE_MODEL,
             usage={"input_tokens": input_tokens, "output_tokens": output_tokens},

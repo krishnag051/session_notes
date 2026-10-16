@@ -22,10 +22,10 @@ services:
 
   backend:
     # Pulled from Docker Hub — the server never needs the repo source at
-    # all for this service. CONFIRM this repo name with Krishna before
-    # first real push/deploy — this is a placeholder following the old TP
-    # project's own naming convention (krishna0051/reviewer-backend), not a
-    # confirmed real Docker Hub repo.
+    # all for this service. Confirmed real (2026-10-15): krishna0051/
+    # session-notes-backend is a genuine, already-pushed Docker Hub repo —
+    # verified directly via `docker pull` + real content inspection, not
+    # just a naming placeholder anymore.
     image: krishna0051/session-notes-backend:latest
     restart: unless-stopped
     depends_on:
@@ -55,7 +55,16 @@ services:
       # — lowered from $2.00 to $1.40 this round, reconciled to be the
       # ONE number for this unit (see app/config.py's own docstring).
       PER_DOCUMENT_HARD_CAP_USD: "1.40"
-      BATCH_MAX_SPEND_USD: "8.00"
+      # Raised 2026-10-15 to $35.00 (Krishna's explicit choice, matching
+      # staging's own cap rather than the more conservative $25 originally
+      # suggested for production specifically) — grounded in the same real
+      # per-document data: 16+ real completed reviews averaging $0.14-0.19/
+      # doc, worst case $0.205/doc seen so far. At $35 and the worst real
+      # per-doc rate, a batch stops itself after ~170 documents — covers
+      # the full real 184-document Mrs. Ungar batch with a bit of room to
+      # spare. See app/config.py's batch_max_spend_usd docstring for the
+      # full real-data history behind this number.
+      BATCH_MAX_SPEND_USD: "35.00"
       RULE_ENGINE_MAX_SPEND_USD: "4.00"
       # Real Postgres/Anthropic/OpenRouter secrets are deliberately NOT set
       # here — they live only in the .env file sitting next to this

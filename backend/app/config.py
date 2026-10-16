@@ -32,11 +32,24 @@ class Settings(BaseSettings):
     # bounds the running total across an ENTIRE batch's auto-triggered
     # reviews (see app/services/batch_reviews.py): once already-completed
     # documents in a batch have spent this much, remaining pending
-    # documents are marked status="skipped_spend_cap" rather than started —
-    # same $4 default as the per-document cap today, but a real, separate
-    # number an operator may want to size differently once real batches
-    # (not just single test uploads) are actually running live.
-    batch_max_spend_usd: float = 4.00
+    # documents are marked status="skipped_spend_cap" rather than started.
+    #
+    # Set 2026-10-15 to $10.00, Krishna's own deliberate, explicit choice
+    # (down from this same day's earlier $40 change) -- grounded in the
+    # same real per-document data: 16 real, non-cached completed reviews
+    # average $0.14361/doc, worst case so far $0.16183/doc (query:
+    # `SELECT status, AVG(spend_usd), MAX(spend_usd) FROM
+    # session_note_reviews WHERE served_from_cache=false GROUP BY
+    # status`). At $10.00 and the worst real per-doc rate, a batch stops
+    # itself after ~$10.00 / $0.16183 ≈ 61-62 documents -- a real, known
+    # consequence worth stating plainly: the real 184-document
+    # "500_Session_Notes_Sample.pdf" batch this cap was originally sized
+    # against will hit this cap again well before all 184 documents are
+    # reviewed, same as it did at the old $8 cap, just further in. A batch
+    # genuinely larger than ~62 documents at this rate needs either
+    # multiple approved runs or an explicit, per-instance cap increase for
+    # that run -- not a silent assumption that $10 covers every real batch.
+    batch_max_spend_usd: float = 10.00
 
     # session_note_extraction.py's own call tracker (agent-making's
     # CallTracker) now DOES estimate real cost, per-provider (Haiku

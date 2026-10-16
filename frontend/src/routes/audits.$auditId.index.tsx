@@ -516,7 +516,7 @@ function AuditDetail() {
         </div>
       </div>
 
-      <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-5 lg:grid-cols-9">
+      <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-5 lg:grid-cols-10">
         <HeaderChip label="Client" value={review.client_name ?? "Unresolved"} />
         <HeaderChip label="Provider" value={review.provider_name ?? "—"} />
         <HeaderChip label="BCBA" value={review.bcba_name ?? "—"} />
@@ -526,6 +526,18 @@ function AuditDetail() {
         <HeaderChip label="End Time" value={review.session_end_time ?? "—"} />
         <HeaderChip label="Score" value={review.score !== null ? `${review.score}%` : "—"} />
         <HeaderChip label="Reviewed By" value={review.reviewed_by ?? "—"} />
+        <HeaderChip
+          label="Real Cost"
+          // The same spend_usd this document's own review already tracked
+          // internally for the per-document/batch spend caps -- never a
+          // separately-computed estimate, so this always matches the real
+          // enforcement number.
+          value={
+            review.served_from_cache
+              ? "$0.00 (cached)"
+              : `$${review.spend_usd.toFixed(4)} · ${review.api_calls_used} call${review.api_calls_used === 1 ? "" : "s"}`
+          }
+        />
       </div>
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">

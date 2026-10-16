@@ -44,9 +44,17 @@ def _load_rules() -> list[dict]:
 
 def classify_batch_pdf(pdf_path: str) -> dict:
     """Phase 1's public wrapper — see classify_batch.py for the full shape.
-    Zero model calls anywhere in this call chain."""
+
+    Not zero-cost anymore as of 2026-10-15: a page range the regex path
+    can't resolve now gets one last-resort Haiku 5.5 fallback attempt
+    (see classify_batch.py's own docstring) before being written to
+    `unresolved` — still free for every section the regex resolves on its
+    own, which is the overwhelming majority case. `batch_label` defaults to
+    the uploaded file's own name, purely so the fallback's log lines are
+    traceable back to a real upload.
+    """
     pages = extract_pdf_text(pdf_path)
-    return classify_batch(pages)
+    return classify_batch(pages, batch_label=Path(pdf_path).name)
 
 
 # Every pipeline module whose code can change a finding's result/evidence

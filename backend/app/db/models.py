@@ -68,6 +68,20 @@ class SessionNoteBatch(Base):
     # default) means the normal per-document real review was scheduled
     # the moment this batch was created.
     auto_review_skipped = Column(Boolean, nullable=False, default=False)
+    # True while a review run (the initial upload-triggered one OR a later
+    # resume) is genuinely in progress for this batch right now — never
+    # true just because this batch has pending documents. The ONE source
+    # of truth both the resume endpoint's double-trigger guard and the
+    # backend-startup orphaned-row recovery sweep read: a PersonDocument
+    # stuck at status="processing" while its own batch's reviews_active is
+    # False means the process that was reviewing it died mid-review, not
+    # that another run still owns it. Claimed atomically (a conditional
+    # UPDATE ... WHERE reviews_active=false, never read-then-write) by
+    # whichever path starts a run, and always released in a finally block
+    # by run_batch_reviews regardless of how that run ends (success,
+    # exception, or the batch spend cap being hit) — see
+    # app/services/batch_reviews.py.
+    reviews_active = Column(Boolean, nullable=False, default=False)
 
     documents = relationship("PersonDocument", back_populates="batch")
 

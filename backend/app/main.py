@@ -2,9 +2,29 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.db.base import SessionLocal
 from app.routers import audits, batches, people, person_documents, reviewers, rule_results, rules, session_note_reviews
+from app.services.batch_reviews import recover_orphaned_processing_reviews
 
 app = FastAPI(title="Session Note Compliance API")
+
+
+@app.on_event("startup")
+def _recover_orphaned_processing_reviews_on_startup() -> None:
+    """Real incident (2026-10-15): a backend process killed mid-batch left
+    a PersonDocument's review stuck at status="processing" forever, needing
+    a manual, by-hand fix before the resume feature existed. Runs once per
+    process start, after alembic's own migration (see Dockerfile's CMD —
+    migrations always run before uvicorn starts), so this is never a
+    manual step again.
+    """
+    db = SessionLocal()
+    try:
+        recovered = recover_orphaned_processing_reviews(db)
+        if recovered:
+            print(f"[startup] recovered {recovered} orphaned 'processing' review(s) back to 'pending'")
+    finally:
+        db.close()
 
 app.add_middleware(
     CORSMiddleware,

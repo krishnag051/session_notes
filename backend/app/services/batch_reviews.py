@@ -16,6 +16,7 @@ from pypdf import PdfReader
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.audit import record as audit_record
 from app.config import settings
 from app.db.base import SessionLocal
 from app.db.models import PersonDocument, SessionNoteBatch, SessionNoteReview
@@ -39,7 +40,62 @@ def create_pending_reviews_for_batch(db: Session, batch: SessionNoteBatch) -> li
     return reviews
 
 
+def recover_orphaned_processing_reviews(db: Session) -> int:
+    """Called once from app/main.py's own startup handler, BEFORE this
+    process serves any request. A SessionNoteReview left at
+    status="processing" whose own batch's reviews_active is False means
+    the process that was reviewing it died mid-review (a kill, a crash, a
+    deploy) — reviews_active would still be True if any genuinely live run
+    still claimed that batch, since run_batch_reviews only ever releases it
+    in its own `finally` block.
+
+    This is the automatic version of the one-off manual fix performed by
+    hand on 2026-10-15 (reset a single real orphaned row, confirmed safe
+    because it had api_calls_used=0/spend_usd=0 — a "processing" review is
+    ALWAYS safe to reset this way: by the time any real billed call could
+    succeed, review.status has already moved past "processing" in
+    run_review's own flow). Returns the number of rows recovered, logged by
+    the caller.
+    """
+    orphaned = db.execute(
+        select(SessionNoteReview)
+        .join(PersonDocument, SessionNoteReview.person_document_id == PersonDocument.id)
+        .join(SessionNoteBatch, PersonDocument.batch_id == SessionNoteBatch.id)
+        .where(SessionNoteReview.status == "processing", SessionNoteBatch.reviews_active.is_(False))
+    ).scalars().all()
+
+    for review in orphaned:
+        audit_record(
+            db, entity_type="session_note_review", entity_id=review.id,
+            changes={"status": ("processing", "pending")}, actor="backend_startup_recovery",
+        )
+        review.status = "pending"
+    if orphaned:
+        db.commit()
+    return len(orphaned)
+
+
 def run_batch_reviews(batch_id: str) -> None:
+    """Runs every still-`pending` document for this batch, one at a time.
+
+    Fix Round (2026-10-15), "real resume feature": the CALLER (either
+    create_batch, for a fresh upload, or the new resume_batch_reviews
+    endpoint) is responsible for atomically CLAIMING
+    SessionNoteBatch.reviews_active=True before scheduling this function —
+    never this function itself, since the resume endpoint's own
+    double-trigger guard needs that claim to happen synchronously, in the
+    request itself, before the response is even sent (this function only
+    ever runs later, as a BackgroundTask). This function's own job is the
+    other half: RELEASING that claim in a `finally` block once it's done,
+    no matter how it ends — normal completion, every document hitting the
+    batch cap, or an unexpected exception — so a run can never leave
+    reviews_active stuck True forever (which would permanently block a
+    future resume). If this process itself is killed (not merely raises)
+    mid-run, reviews_active never gets released here at all — that's
+    exactly the gap the backend startup recovery sweep exists for (see
+    app/main.py), using reviews_active=False as the "is anything actually
+    still claiming this orphaned processing row" signal.
+    """
     db = SessionLocal()
     try:
         batch = db.get(SessionNoteBatch, batch_id)
@@ -100,4 +156,16 @@ def run_batch_reviews(batch_id: str) -> None:
             if review.status in ("complete", "cancelled_spend_cap"):
                 running_total += review.spend_usd
     finally:
+        # Released unconditionally, even if the try block above raised
+        # partway through — a fresh query (not the possibly-stale `batch`
+        # object from above, which may belong to a rolled-back transaction
+        # after an exception) and its own commit, isolated from whatever
+        # state the rest of this function's own session was left in.
+        try:
+            live_batch = db.get(SessionNoteBatch, batch_id)
+            if live_batch is not None and live_batch.reviews_active:
+                live_batch.reviews_active = False
+                db.commit()
+        except Exception:
+            db.rollback()
         db.close()

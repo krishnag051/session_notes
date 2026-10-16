@@ -63,7 +63,56 @@ DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-5"  # matches judge.py's MODEL
 # a bad moment, get a real answer anyway" shouldn't itself become the slow/
 # expensive path. Never the model for anthropic as a PRIMARY provider
 # choice (DEFAULT_ANTHROPIC_MODEL/judge.py's MODEL stay Sonnet for that).
-ANTHROPIC_FALLBACK_MODEL = "claude-haiku-4-5"
+#
+# Switched 2026-10-15 from claude-haiku-4-5 to claude-haiku-5-5 (Krishna's
+# explicit, blanket instruction this round: every real Haiku 4.5 call site
+# in this project moves to 5.5) -- same real $0.10/$0.50 per MTok pricing
+# already confirmed live against platform.claude.com for the other two
+# Haiku 5.5 call sites added in prior rounds (classify_batch.py's fallback,
+# session_note_extraction.py's own default). The constant NAME is unchanged
+# -- every real caller (call_openrouter_with_fallback's own default
+# argument) still means exactly what it always meant, "the real, billed
+# model this pipeline falls back to when OpenRouter is failing" -- only the
+# real model string underneath it changed.
+ANTHROPIC_FALLBACK_MODEL = "claude-haiku-5-5"
+
+# Separate, distinctly-named constant for classify_batch.py's own fallback
+# (2026-10-15) -- deliberately NOT sharing ANTHROPIC_FALLBACK_MODEL above,
+# even though both now resolve to the SAME real model string -- each real
+# call site names its own model choice explicitly, never implied by reusing
+# another site's constant (see this constant's own history: it existed
+# specifically to avoid repointing ANTHROPIC_FALLBACK_MODEL by accident
+# when only classify_batch.py's own call was meant to change; now that both
+# are deliberately on 5.5 for independent reasons, keeping them separate
+# still means a future change to ONE of them can never silently change the
+# other). Confirmed live against platform.claude.com's own model list:
+# claude-haiku-5-5 is a real, released model ID ("Claude API ID: claude-
+# haiku-5-5"), described by Anthropic itself as "For high-volume, latency-
+# sensitive tasks such as classification, extraction, and routing" -- used
+# by classify_batch.py's last-resort fallback for a page range the
+# deterministic regex path could not resolve.
+CLASSIFICATION_FALLBACK_MODEL = "claude-haiku-5-5"
+
+# session_note_extraction.py's own PRIMARY model as of 2026-10-15 -- same
+# real model/pricing as CLASSIFICATION_FALLBACK_MODEL above (both are
+# "claude-haiku-5-5"; kept as two distinctly-named constants for the same
+# reason classify_batch.py's own fallback constant is separate from
+# ANTHROPIC_FALLBACK_MODEL -- each real call site names its own model
+# choice explicitly, never implied by reusing another site's constant).
+# Replaces the free OpenRouter/Nemotron default that call_tool_json's
+# generic model_override=None resolution previously fell through to for
+# this call site -- a real incident (2026-10-15): a live 184-document
+# batch was observed crawling, with logs showing repeated free-tier
+# OpenRouter rate-limit retries on this exact call ('session_note_
+# extraction'). Never a deliberate, scoped cost-saving choice for this
+# real production call site -- confirmed no docker-compose.yml/
+# docker-compose.staging.yml ever set AGENT_LLM_PROVIDER/AGENT_LLM_MODEL to
+# override call_tool_json's generic "openrouter for everything" default, so
+# this was a leftover default from a module built "for building and
+# automated/CI testing" (see this module's own top docstring) that was
+# wired into the real per-document review path without ever being
+# overridden for it.
+SESSION_NOTE_EXTRACTION_MODEL = "claude-haiku-5-5"
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_TIMEOUT_SECONDS = 120
@@ -597,16 +646,32 @@ def call_tool_json_with_images(
     return tool_use_block.input
 
 
-# Per-provider pricing lookup for CallTracker.estimated_cost_usd below --
-# "openrouter" is genuinely $0 by construction (see this module's own
-# docstring); "anthropic" and "anthropic-fallback" route to DIFFERENT real
-# models (Sonnet vs Haiku -- see DEFAULT_ANTHROPIC_MODEL/
-# ANTHROPIC_FALLBACK_MODEL above) with different real rate cards, so they
-# each get their own entry rather than one shared Anthropic rate.
-_PRICING_BY_PROVIDER = {
-    "openrouter": (0.0, 0.0),
-    "anthropic": (call_tracker.INPUT_COST_PER_MTOK, call_tracker.OUTPUT_COST_PER_MTOK),
-    "anthropic-fallback": (call_tracker.HAIKU_INPUT_COST_PER_MTOK, call_tracker.HAIKU_OUTPUT_COST_PER_MTOK),
+# Per-MODEL pricing lookup for CallTracker.estimated_cost_usd below -- keyed
+# by the real model string, NOT by the 3-way provider label ("openrouter"/
+# "anthropic"/"anthropic-fallback"). REAL BUG FOUND AND FIXED (2026-10-15):
+# the "anthropic" provider label is not one model -- with session_note_
+# extraction.py now calling claude-haiku-5-5 directly via
+# model_override="anthropic:claude-haiku-5-5" (removing its OpenRouter
+# free-tier default), a per-PROVIDER table would have silently priced that
+# real Haiku 5.5 call at the Sonnet rate it shares the "anthropic" label
+# with -- a ~20x overstatement of its real cost ($2/$10 Sonnet vs
+# $0.10/$0.50 Haiku 5.5 per MTok), corrupting the per-document hard cap and
+# the batch-cumulative cap's own real-dollar tracking. Caught before this
+# ever ran for real by re-checking this table while wiring that change in.
+_PRICING_BY_MODEL = {
+    DEFAULT_ANTHROPIC_MODEL: (call_tracker.INPUT_COST_PER_MTOK, call_tracker.OUTPUT_COST_PER_MTOK),
+    # ANTHROPIC_FALLBACK_MODEL, CLASSIFICATION_FALLBACK_MODEL, and
+    # SESSION_NOTE_EXTRACTION_MODEL are now all the SAME real string
+    # ("claude-haiku-5-5", as of this round's blanket Haiku 4.5 -> 5.5
+    # switch) -- three dict entries that happen to collide on one key
+    # rather than one shared entry, deliberately: each constant is still
+    # named and priced independently here so a future change to any ONE
+    # of them (e.g. if a call site's own model choice diverges again) is a
+    # one-line edit, not a hunt through this dict for which key it secretly
+    # shares.
+    ANTHROPIC_FALLBACK_MODEL: (call_tracker.HAIKU_5_5_INPUT_COST_PER_MTOK, call_tracker.HAIKU_5_5_OUTPUT_COST_PER_MTOK),
+    CLASSIFICATION_FALLBACK_MODEL: (call_tracker.HAIKU_5_5_INPUT_COST_PER_MTOK, call_tracker.HAIKU_5_5_OUTPUT_COST_PER_MTOK),
+    SESSION_NOTE_EXTRACTION_MODEL: (call_tracker.HAIKU_5_5_INPUT_COST_PER_MTOK, call_tracker.HAIKU_5_5_OUTPUT_COST_PER_MTOK),
 }
 
 
@@ -623,10 +688,14 @@ class CallTracker:
     but-missing -- callers (e.g. session_note_extraction.py's own real
     call site) had call-count visibility but NO cost estimate at all, a
     real blind spot in any batch-level spend cap built on top of this
-    tracker. Tokens are now tracked PER PROVIDER (not just in aggregate),
-    since "anthropic" (Sonnet) and "anthropic-fallback" (Haiku) have
-    different real per-token rates and a single aggregate total-tokens
-    number can't be priced correctly across both.
+    tracker. Tokens are tracked PER MODEL (not per provider, and not just
+    in aggregate) -- REAL BUG FOUND AND FIXED (2026-10-15): the "anthropic"
+    provider label alone is not enough to price a call correctly once more
+    than one real model can share it (claude-sonnet-5 AND claude-haiku-5-5
+    both resolve to provider="anthropic"); per-provider bucketing would
+    have silently priced a real Haiku 5.5 call at Sonnet's ~20x higher
+    rate. Per-model bucketing prices each real model at its own real rate
+    regardless of which provider label it arrived under.
     """
 
     def __init__(self, max_calls: int | None = None, max_spend_usd: float | None = None):
@@ -648,7 +717,7 @@ class CallTracker:
         self.max_spend_usd = max_spend_usd
         self.count = 0
         self.calls_by_provider: dict[str, int] = {}
-        self.tokens_by_provider: dict[str, dict[str, int]] = {}
+        self.tokens_by_model: dict[str, dict[str, int]] = {}
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         # Fix Round (Performance, 2026-09-11): both real call sites this
@@ -686,9 +755,9 @@ class CallTracker:
             output_tokens = usage.get("output_tokens", 0)
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
-            provider_tokens = self.tokens_by_provider.setdefault(provider, {"input": 0, "output": 0})
-            provider_tokens["input"] += input_tokens
-            provider_tokens["output"] += output_tokens
+            model_tokens = self.tokens_by_model.setdefault(model, {"input": 0, "output": 0})
+            model_tokens["input"] += input_tokens
+            model_tokens["output"] += output_tokens
             print(
                 f"[model-provider] call #{self.count} ({provider}:{model}, reason={reason!r}) -- "
                 f"tokens in={usage.get('input_tokens', 0)} out={usage.get('output_tokens', 0)}. "
@@ -698,14 +767,20 @@ class CallTracker:
 
     @property
     def estimated_cost_usd(self) -> float:
-        """Real dollar estimate, summed per-provider so a Haiku fallback
-        call and a Sonnet primary call are each priced at their own real
-        rate rather than one shared assumption. Unknown providers price at
-        $0 rather than raising -- this tracker's job is visibility, not to
-        become a second place call-site changes have to keep in sync."""
+        """Real dollar estimate, summed per-MODEL (not per-provider -- see
+        this class's own docstring for the real mispricing bug that would
+        otherwise follow) so each real model is priced at its own real
+        rate. An OpenRouter free-tier model is never in this dict and
+        correctly prices at $0; an unrecognized REAL (Anthropic) model also
+        prices at $0 rather than raising -- this tracker's job is
+        visibility, not to become a second place call-site changes have to
+        keep in sync -- but that also means a newly-added real Anthropic
+        model MUST be added to _PRICING_BY_MODEL above or its real cost
+        will silently read as free, never overstated but also never
+        visible."""
         total = 0.0
-        for provider, tokens in self.tokens_by_provider.items():
-            input_rate, output_rate = _PRICING_BY_PROVIDER.get(provider, (0.0, 0.0))
+        for model, tokens in self.tokens_by_model.items():
+            input_rate, output_rate = _PRICING_BY_MODEL.get(model, (0.0, 0.0))
             total += tokens["input"] / 1_000_000 * input_rate
             total += tokens["output"] / 1_000_000 * output_rate
         return total
